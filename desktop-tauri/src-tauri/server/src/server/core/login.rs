@@ -651,6 +651,52 @@ impl LoginService {
                 codearts::Callback::Failed(status, message) => Err(GatewayError::with_status(i32::from(status), message)),
             };
         }
+        // ── AutoClaw（国内 / 国际）：远程部署下的「粘贴回调」通道 ──────
+        //
+        // 2026-09-30 新增。AutoClaw 的 `navigate_uri` **必须**长成
+        // `http://localhost:<登记端口|网关端口>/auth/callback-<vendor>`（上游按
+        // 白名单逐字校验，见 `providers::autoclaw::oauth::CALLBACK_PATH_PREFIX`）。
+        // 网关部署在远程（Docker / 云主机）时，浏览器把那个 `localhost` 解析成
+        // **用户自己那台机器**，回调永远打不到网关 —— 面板网页登录 100% 失败
+        // （issue #46；日志里表现为「回调 http://localhost:3066，等待浏览器回调…」
+        // 然后超时）。
+        //
+        // 这里补的正是 gpt-load / one-api 那一类网关的标准兜底：**让用户把浏览器
+        // 地址栏里那条（打不开的）回调地址原样粘回来**。授权码是一次性的、且
+        // 绑定在 `navigate_uri` 上，所以换码所需的全部信息（vendor / code /
+        // upstream_state）都在这条 URL 里，粘回来即可完成登录，不需要任何额外
+        // 基础设施（端口映射 / 隧道 / 公网地址）。
+        if matches!(kind, ProviderKind::AutoClaw | ProviderKind::AutoClawIntl) {
+            use crate::server::core::providers::autoclaw::oauth::{Vendor, CALLBACK_PATH_PREFIX};
+            let parsed = url::Url::parse(callback_url).map_err(|_| {
+                GatewayError::with_status(400, "回调地址格式不正确，请粘贴浏览器地址栏里的完整地址")
+            })?;
+            let Some(vendor) = parsed
+                .path()
+                .strip_prefix(CALLBACK_PATH_PREFIX)
+                .and_then(Vendor::from_id)
+            else {
+                return Err(GatewayError::with_status(
+                    400,
+                    "这条地址不是 AutoClaw 的登录回调，请粘贴浏览器地址栏里的完整地址",
+                ));
+            };
+            let params: std::collections::HashMap<String, String> = parsed
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            // 用户拒绝授权时上游会把 error 回在查询串里，照实落定任务
+            if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+                let message = format!("授权被拒绝（{error}）");
+                finish_task_error(&handle, &message);
+                return Err(GatewayError::with_status(400, message));
+            }
+            let code = params.get("code").cloned().unwrap_or_default();
+            let upstream_state = params.get("state").cloned().unwrap_or_default();
+            return self
+                .finish_autoclaw_oauth_callback(vendor, &upstream_state, &code)
+                .await;
+        }
         if kind != ProviderKind::Raccoon {
             return Err(GatewayError::with_status(400, "该登录任务不接收授权码回调"));
         }

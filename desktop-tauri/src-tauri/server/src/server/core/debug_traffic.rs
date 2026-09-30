@@ -136,6 +136,17 @@ pub const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 /// 名单在 OmniProxy 的基础上补齐了**我们五家用到的自定义头**：各家适配器
 /// 会在头里带 token / cookie / 签名（见 `providers/*/adapter.rs` 的
 /// `build_chat_request`）。宁可多脱几个（多脱只损失排障信息，少脱是事故）。
+///
+/// ── 2026-09-30 修正：名单曾经漏掉真正在用的头 ─────────────────
+/// 原名单里写的是 `x-autoclaw-token`，但 AutoClaw 出站实际用的是
+/// **`X-Authorization`**（见 `providers/autoclaw/adapter.rs` 的注释：上游
+/// 只认这个头，`Authorization: Bearer` 会被判 Invalid token）。而匹配是
+/// **精确相等**（见 [`is_sensitive_header`]），于是「开了调试模式」正好会把
+/// 账号 access token 明文写进 `debug_traffic` 表、在面板详情里展示、并随
+/// 导出/截图流进 issue —— 而开调试模式恰恰是用户为了提 issue 才做的动作。
+/// 同批漏网的还有 Trae 的 `X-Cloudide-Token`、CodeArts 的 `X-Security-Token`
+/// 等。本次除了把已知头逐个补上，还把匹配改成「精确名单 ∪ 关键词后缀」，
+/// 新增 provider 时不再需要人工同步这张表。
 const SENSITIVE_HEADERS: &[&str] = &[
     "authorization",
     "proxy-authorization",
@@ -155,7 +166,39 @@ const SENSITIVE_HEADERS: &[&str] = &[
     "x-qoder-token",
     "x-catpaw-cookie",
     "x-autoclaw-token",
+    // ── 2026-09-30 补齐：各 provider 实际在用的凭据头 ────────────
+    "x-authorization",
+    "x-cloudide-token",
+    "x-security-token",
+    "x-model-key",
+    "x-internal-model-key",
+    "x-auth-sign",
+    "x-signature",
+    "x-csrf-token",
+    "x-xsrf-token",
+    "x-session-token",
+    "x-device-token",
+    "x-machine-token",
 ];
+
+/// 头名里出现这些**子串**即视为凭据（在 [`SENSITIVE_HEADERS`] 精确名单之外
+/// 再兜一层）。用于「新增 provider 忘了同步名单」的场景：多脱一个头只损失
+/// 排障信息，少脱一个是凭据泄漏，两边不对称，所以这里故意取宽。
+///
+/// 只做子串匹配、不看语义，因此刻意避开了 `key` 这种会误伤业务头的词
+/// （`x-model-key` 已在精确名单里覆盖）；留下的都是「一旦出现几乎必然是
+/// 凭据」的片段。
+const SENSITIVE_HEADER_MARKERS: &[&str] = &["token", "auth", "cookie", "sign", "secret"];
+
+/// 判断一个请求头名是否需要脱敏（`name` 由调用方转成小写）。
+///
+/// 先查精确名单，再查子串标记 —— 两级都命中不了才放行。
+pub(crate) fn is_sensitive_header(lower_name: &str) -> bool {
+    SENSITIVE_HEADERS.contains(&lower_name)
+        || SENSITIVE_HEADER_MARKERS
+            .iter()
+            .any(|marker| lower_name.contains(marker))
+}
 
 /// 脱敏占位符（与 OmniProxy 同字面量，便于对照两边的日志）
 pub const REDACTED: &str = "[redacted]";
@@ -455,7 +498,7 @@ pub fn redact_headers<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>)
     let mut object = serde_json::Map::new();
     for (name, value) in headers {
         let lower = name.to_ascii_lowercase();
-        let shown = if SENSITIVE_HEADERS.contains(&lower.as_str()) {
+        let shown = if is_sensitive_header(&lower) {
             REDACTED
         } else {
             value

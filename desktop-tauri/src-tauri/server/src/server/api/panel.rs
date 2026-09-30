@@ -135,13 +135,24 @@ pub async fn panel_setup(
 /// `POST /api/panel/login` —— 账号密码换双令牌。
 pub async fn panel_login(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     if !access::admin_registered() {
         return management_error(400, "尚未注册管理员账号：请先在登录页完成首次注册");
     }
-    if access::login_locked(addr.ip()) {
-        logging::log("[Security]", &format!("❌ 面板登录已锁定（{}）", addr.ip()));
+    // 锁定按**真实来源**计。反代 / 容器部署下所有请求的对端都是同一个代理
+    // 地址，直接拿它当键会让「随便一个人连错几次」把管理员一起锁在门外
+    // （2026-09-30 修正；采信口径见 access::login_source_ip）。
+    let source = access::login_source_ip(
+        addr.ip(),
+        headers.get("x-real-ip").and_then(|value| value.to_str().ok()),
+        headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok()),
+    );
+    if access::login_locked(source) {
+        logging::log("[Security]", &format!("❌ 面板登录已锁定（{source}）"));
         return management_error(429, "登录失败次数过多，请 5 分钟后再试");
     }
     let payload = parse_body(&body).unwrap_or(serde_json::Value::Null);
@@ -155,12 +166,12 @@ pub async fn panel_login(
         .unwrap_or("");
 
     if !access::verify_login(&username, password) {
-        access::record_login_failure(addr.ip());
-        logging::log("[Security]", &format!("❌ 面板登录失败（{}）", addr.ip()));
+        access::record_login_failure(source);
+        logging::log("[Security]", &format!("❌ 面板登录失败（{source}）"));
         return management_error(401, "账号或密码不正确");
     }
-    access::clear_login_failures(addr.ip());
-    logging::log("[Security]", &format!("✅ 面板登录成功（{}）", addr.ip()));
+    access::clear_login_failures(source);
+    logging::log("[Security]", &format!("✅ 面板登录成功（{source}）"));
     issue_response(access::IssuedSession::new_session())
 }
 
@@ -179,8 +190,14 @@ pub async fn panel_refresh(headers: HeaderMap) -> Response {
 pub async fn panel_logout(headers: HeaderMap) -> Response {
     access::revoke_session(refresh_cookie_of(&headers), &headers);
     let mut response = ok_json(serde_json::json!({ "loggedIn": false }));
-    for name in [access::ACCESS_COOKIE, access::REFRESH_COOKIE] {
-        let clear = format!("{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+    // 两个 cookie 下发时的 Path 不同（access 是 `/`，refresh 是 `/api/panel`），
+    // 清除时必须用**各自那个 Path**，否则浏览器按「同名 + 同 Path」匹配不上，
+    // 根本不会删（2026-09-30 修正：原来一律用 Path=/，refresh cookie 会残留）。
+    for (name, path) in [
+        (access::ACCESS_COOKIE, "/"),
+        (access::REFRESH_COOKIE, "/api/panel"),
+    ] {
+        let clear = format!("{name}=; Path={path}; HttpOnly; SameSite=Lax; Max-Age=0");
         if let Ok(value) = axum::http::HeaderValue::from_str(&clear) {
             response.headers_mut().append(SET_COOKIE, value);
         }

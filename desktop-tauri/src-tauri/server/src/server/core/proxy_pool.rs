@@ -54,7 +54,7 @@
 //! 不参与选路 —— 转发不会因为上次测试失败就跳过某个出口（判断出口可用性
 //! 的唯一权威是实际请求的结果，测试结果只回答「上次手测时通不通」）。
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Map, Value};
 
@@ -73,6 +73,28 @@ const MAX_LABEL_LENGTH: usize = 100;
 
 /// 进程级库句柄（照 `core::task_state` 的形态：bootstrap 时 install 一次）
 static DB: OnceLock<Option<Db>> = OnceLock::new();
+
+/// 读-改-写互斥锁。
+///
+/// ── 2026-09-30 修正：原先写路径全程无锁 ───────────────────────
+/// `create` / `update` / `remove` / `sync_clash` / `record_test` 都是
+/// 「`read_items()` → 内存改 → `write_items()` 整份覆盖」，彼此之间没有任何
+/// 互斥；而 `GET /api/proxies/pool` 每次都会触发一次 `sync_clash()`
+/// （见 `api::proxies`），于是「打开页面」和「新增 / 测试出口」天然并发。
+/// 后果是**静默丢数据**：刚新增的代理消失、刚测出的 `lastTest` 被覆盖、
+/// 并发同步产生重复条目 —— 用户只会觉得「界面偶尔丢东西」，很难归因。
+///
+/// 只锁写路径：`read_items()` 仍无锁（它读到的要么是旧快照、要么是新快照，
+/// 对本模块「整份覆盖」的写语义来说都可接受）。这也避免了 `create` 末尾
+/// 调用 `list()` 时的自锁死。
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 取写锁（中毒时沿用内部值 —— 与仓库其它锁的取向一致）。
+fn write_guard() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// 接线（`ServerState::bootstrap` 调用）。重复调用无副作用。
 pub fn install(db: Option<Db>) {
@@ -373,6 +395,7 @@ fn find_raw(id: &str) -> Option<Value> {
 // ─── 写操作 ─────────────────────────────────────────────────
 
 pub fn create(input: &Value) -> Result<Vec<Value>, String> {
+    let _guard = write_guard();
     let item = normalize_item(input, None)?;
     let mut items = read_items();
     // 新条目排在最前（与账号页「新加的看得见」一致；代理数量少，没有再排序的价值）
@@ -395,6 +418,7 @@ const CLASH_READONLY_HINT: &str =
     "该代理来自 Clash Verge 同步（名称 / 端口 / 启用都跟随 Clash），请到 Clash Verge 中修改";
 
 pub fn update(input: &Value) -> Result<Vec<Value>, String> {
+    let _guard = write_guard();
     let id = clean_string(input.get("id"), MAX_LABEL_LENGTH);
     if id.is_empty() {
         return Err("缺少代理 id".to_string());
@@ -422,6 +446,7 @@ pub fn update(input: &Value) -> Result<Vec<Value>, String> {
 /// 删除条目；返回（最新列表, 被删条目的名称 —— 调用方拼日志/提示用）。
 /// Clash 同步来的条目不可删（照 OmniProxy）：去 Clash 里删出口，下次同步自然摘掉。
 pub fn remove(id: &str) -> Result<(Vec<Value>, String), String> {
+    let _guard = write_guard();
     let mut items = read_items();
     let Some(index) = items
         .iter()
@@ -467,6 +492,7 @@ struct SyncTarget {
 /// 手工改库造出的重复 uid（同一条 Clash 出口两条池条目）在收尾的 retain 里去重，
 /// 只留第一行 —— 结果自然收敛到一 uid 一条。
 pub fn sync_clash() -> ClashSyncReport {
+    let _guard = write_guard();
     let snapshot = crate::server::core::clash::clash_snapshot();
     if !snapshot.available {
         return ClashSyncReport {
@@ -589,6 +615,7 @@ pub struct TestOutcome {
 
 /// 记下一次连通性测试的结果（前端行内「测试」与弹窗里的测试都走它）。
 pub fn record_test(id: &str, result: &TestOutcome) -> Result<Vec<Value>, String> {
+    let _guard = write_guard();
     let mut items = read_items();
     let Some(index) = items
         .iter()

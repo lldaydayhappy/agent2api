@@ -121,7 +121,8 @@ async fn aggregate_frame_stream_inner(
     // 下面这个 `while let` 永不退出 —— 聚合明明已经读到上游 EOF，却要空转到
     // 非流式总超时（默认 300 秒）才报 502（详见 `cancellable` 的说明）。
     let mut stream = cancellation::cancellable(stream, telemetry.cancel_token());
-    let mut buffer = String::new();
+    // 字节缓冲，不是 String —— 理由见下面 push 处（2026-09-30 修正）
+    let mut buffer: Vec<u8> = Vec::new();
     let mut acc = CompletionAccumulator { rewrite: model_rewrite, ..Default::default() };
     // 首响采集：聚合路径不走 RecordingStream（客户端要的是完整 JSON，
     // 没有下发流可言），所以第一个**上游** chunk 在这里记 —— 它就是
@@ -154,10 +155,17 @@ async fn aggregate_frame_stream_inner(
         if let Some(capture) = telemetry.capture() {
             capture.push(&chunk);
         }
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        // 逐行消费（只处理到最后一个 '\n' 之前的内容）
-        while let Some(index) = buffer.find('\n') {
-            let line = buffer[..index].trim().to_string();
+        // ── 按**字节**攒行，只在完整行上做 UTF-8 解码 ──────────────
+        // 2026-09-30 修正：原实现是
+        //     buffer.push_str(&String::from_utf8_lossy(&chunk));
+        // 即对**每个 TCP 分片**单独解码。分片边界落在 3 字节汉字的中间时，
+        // 那半个字会被永久替换成 U+FFFD（`�`）—— 非流式中文长回答因此会
+        // 零星出现乱码，而中文正是本项目的主要场景。
+        // 同目录 `sse.rs::push` 与 `providers/trae/forward.rs` 用的都是
+        // 「字节缓冲 + 只在完整行上解码」，这里对齐它们的口径。
+        buffer.extend_from_slice(&chunk);
+        while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+            let line = String::from_utf8_lossy(&buffer[..index]).trim().to_string();
             buffer.drain(..=index);
             if line.is_empty() {
                 continue;
@@ -168,8 +176,8 @@ async fn aggregate_frame_stream_inner(
             return Err(GatewayError::with_status(502, "上游返回的单行数据过大，已中断"));
         }
     }
-    // 尾行（上游没以换行结尾）
-    let tail = buffer.trim().to_string();
+    // 尾行（上游没以换行结尾）—— 同样是完整的一行，可以安全解码
+    let tail = String::from_utf8_lossy(&buffer).trim().to_string();
     if !tail.is_empty() {
         acc.consume_line(&tail, &telemetry)?;
     }

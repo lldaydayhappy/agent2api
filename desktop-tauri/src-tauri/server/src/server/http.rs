@@ -725,14 +725,20 @@ fn scope_for_key(
 /// （`GET /v1/models` 的 handler）。实现与 `request_matches_key` 逐字一致 ——
 /// 后者委托给它，保证两处不可能漂移。
 fn headers_match_key(headers: &axum::http::HeaderMap, expected: &str) -> bool {
+    // 恒定时间比较：API Key 是长期凭据，`==` 的短路会泄漏「前 n 个字节匹配」
+    // 的时序信息（2026-09-30 修正，复用 access.rs 里的同一个实现）。
+    let eq = |candidate: &str| {
+        crate::server::access::constant_time_eq(candidate.as_bytes(), expected.as_bytes())
+    };
+
     if let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-        if strip_bearer_prefix(value) == expected {
+        if eq(strip_bearer_prefix(value)) {
             return true;
         }
     }
 
     if let Some(value) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        if value == expected {
+        if eq(value) {
             return true;
         }
     }

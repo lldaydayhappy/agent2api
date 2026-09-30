@@ -249,12 +249,87 @@ pub fn shim_js() -> &'static str {
     throw new Error('登录等待超时（5 分钟）');
   }
 
+  /**
+   * 「粘贴回调」浮层 —— 只给 AutoClaw（国内 / 国际）用。
+   *
+   * ── 为什么需要它（2026-09-30 新增，对应 issue #46）──────────
+   * AutoClaw 交给上游的授权回调地址**必须**是
+   * `http://localhost:<登记端口>/auth/callback-<vendor>`（上游按 client 登记的
+   * 白名单逐字校验，改成任何别的 host 都会被拒）。网关跑在远程（Docker /
+   * 云主机）时，那个 `localhost` 指的是**用户自己那台机器** —— 浏览器跳过去
+   * 只会看到「无法访问」，回调永远到不了网关，面板网页登录必然失败
+   * （服务端日志表现为「回调 http://localhost:3066，等待浏览器回调…」后超时）。
+   *
+   * 此时唯一不依赖额外基础设施的出路，就是把浏览器**地址栏里那条地址原样粘
+   * 回来**（gpt-load / one-api 这一类网关的标准兜底），由服务端解析出
+   * vendor / code / state 完成换码。授权码是一次性的、且绑定在这次登录的
+   * `navigate_uri` 上，所以这条 URL 本身就是全部所需信息 —— 不需要端口映射、
+   * 不需要隧道、不需要公网地址。
+   */
+  function showCallbackPaste(state, provider) {
+    var stale = document.getElementById('a2a-callback-paste');
+    if (stale) stale.remove();
+
+    var box = document.createElement('div');
+    box.id = 'a2a-callback-paste';
+    box.style.cssText = 'position:fixed;z-index:2147483000;right:16px;bottom:16px;'
+      + 'max-width:440px;background:#fff;color:#111;border:1px solid #d0d7de;'
+      + 'border-radius:10px;padding:14px 16px;font-size:13px;line-height:1.6;'
+      + 'box-shadow:0 8px 28px rgba(0,0,0,.18)';
+
+    var title = document.createElement('div');
+    title.innerHTML = '<b>登录需要手动粘贴回调地址</b>';
+    var hint = document.createElement('div');
+    hint.style.cssText = 'margin:6px 0;color:#555';
+    hint.innerHTML = '浏览器打开的那个 <code>localhost</code> 地址指向你自己的设备，'
+      + '网关在远程收不到。请把浏览器<b>地址栏里的完整地址</b>复制到下面：';
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'http://localhost:18432/auth/callback-google?code=...&state=...';
+    input.style.cssText = 'width:100%;box-sizing:border-box;padding:6px 8px;'
+      + 'border:1px solid #d0d7de;border-radius:6px;font-size:12px';
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:8px;margin-top:8px;align-items:center';
+    var submit = document.createElement('button');
+    submit.type = 'button';
+    submit.textContent = '提交';
+    submit.style.cssText = 'padding:5px 14px;border:0;border-radius:6px;'
+      + 'background:#2563eb;color:#fff;cursor:pointer';
+    var status = document.createElement('span');
+    status.style.cssText = 'color:#666';
+    row.appendChild(submit);
+    row.appendChild(status);
+
+    box.appendChild(title);
+    box.appendChild(hint);
+    box.appendChild(input);
+    box.appendChild(row);
+    document.body.appendChild(box);
+    try { input.focus(); } catch (e) { /* 无害 */ }
+
+    submit.addEventListener('click', async function () {
+      var value = (input.value || '').trim();
+      if (!value) { status.textContent = '请先粘贴地址'; return; }
+      status.textContent = '提交中…';
+      submit.disabled = true;
+      try {
+        await call('POST', '/api/session/login/callback', { state: state, callbackUrl: value });
+        status.textContent = '已提交，等待完成…';
+      } catch (e) {
+        status.textContent = '失败：' + (e && e.message ? e.message : e);
+        submit.disabled = false;
+      }
+    });
+    return box;
+  }
+
   /** 发起一次登录流程：先开窗口（用户手势还在时占位成功率高），再拿地址导航。 */
   async function runLoginFlow(provider, startRequest) {
     loginActive = true;
     loginProvider = provider;
     emitLogin();
     var popup = null;
+    var pasteBox = null;
     try { popup = window.open('about:blank', 'a2a-login'); } catch (e) { /* 拦截时走兜底 */ }
     try {
       var started = await startRequest;
@@ -267,8 +342,14 @@ pub fn shim_js() -> &'static str {
         try { second = window.open(authUrl, '_blank'); } catch (e) { /* 落到链接兜底 */ }
         if (!second) showLinkFallback(authUrl);
       }
+      // AutoClaw 的回调地址写死在 localhost（上游白名单），远程部署下浏览器
+      // 打不到网关 —— 挂一个粘贴框兜底（见 showCallbackPaste 的说明）。
+      if (provider === 'autoclaw' || provider === 'autoclaw-intl') {
+        pasteBox = showCallbackPaste(started.state, provider);
+      }
       return await pollWait(started.state);
     } finally {
+      if (pasteBox) { try { pasteBox.remove(); } catch (e) { /* 无害 */ } }
       if (popup && !popup.closed) { try { popup.close(); } catch (e) { /* 无害 */ } }
       loginActive = false;
       loginProvider = '';

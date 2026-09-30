@@ -938,11 +938,30 @@ pub fn error_response(
 
 // ─── 调试落盘 ───────────────────────────────────────────────
 
+/// 单份调试落盘的最大体积：超过就整份不落。
+///
+/// 为什么要这道闸：`/v1/*` 的 `DefaultBodyLimit` 已被放开，一条带长上下文的
+/// 请求体实测可到 3 MB（极端情况几十 MB）。调试落盘是覆盖写，体积等于**每次
+/// 请求**的磁盘写入量。
+const DEBUG_WRITE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
 /// 调试落盘：原始 body + 一行 meta（覆盖写；**失败不影响请求**）。
 ///
 /// 与 Node 版一致：目录不存在时创建，任何 IO 失败都静默吞掉 ——
 /// 调试落盘是排障辅助，不能因为它失败就让用户的请求失败。
+///
+/// ── 2026-09-30 修正：挂到调试开关下 + 加体积闸 ────────────────
+/// 原先无条件执行，于是**每一次**对话请求都会把完整入站 body 覆盖写一遍盘：
+/// ① 在 async handler 里做阻塞 IO，阻塞 tokio worker；
+/// ② 在用户毫不知情时把请求体持久化（其中可能含粘贴的密钥与隐私内容）。
+/// 现在只有开了「调试模式」才落盘，且超过 [`DEBUG_WRITE_MAX_BYTES`] 直接跳过。
 pub fn write_debug_files(body: &[u8], method: &str, path: &str, user_agent: &str) {
+    if !config::current().debug_mode() {
+        return;
+    }
+    if body.len() > DEBUG_WRITE_MAX_BYTES {
+        return;
+    }
     let dir = config::config_dir().join(DEBUG_DIR);
     if std::fs::create_dir_all(&dir).is_err() {
         return;

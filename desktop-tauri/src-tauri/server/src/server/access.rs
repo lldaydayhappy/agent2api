@@ -225,7 +225,11 @@ pub fn verify_login(username: &str, password: &str) -> bool {
     store_admin().is_some_and(|expected| verify_credentials(username, password, &expected))
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// 恒定时间字节比较（长度不等直接判否 —— 长度本身不是秘密）。
+///
+/// 公开给 `server::http` 的 API Key 校验使用：Key 是长期凭据，用 `==` 比较
+/// 会因短路而泄漏「前多少个字节匹配」的时序信息（2026-09-30 修正）。
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -557,6 +561,61 @@ pub fn clear_login_failures(source: IpAddr) {
             poisoned.into_inner().remove(&source);
         }
     };
+}
+
+/// 直连对端是否「离我们足够近」—— loopback 或私有网段。
+///
+/// 只有这种对端才可能是一层我们自己的反向代理（Docker 网桥网关、宿主上的
+/// nginx、本机浏览器），因此也只有在它面前，代理头才值得采信。
+fn is_private_peer(peer: IpAddr) -> bool {
+    match peer {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                // ULA（fc00::/7）与链路本地（fe80::/10）
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// 是否采信 `X-Real-IP` / `X-Forwarded-For`。默认开，`AGENT2API_TRUST_PROXY_HEADERS=0` 关。
+fn trust_proxy_headers() -> bool {
+    !matches!(
+        std::env::var("AGENT2API_TRUST_PROXY_HEADERS").as_deref(),
+        Ok("0") | Ok("false") | Ok("no")
+    )
+}
+
+/// 从「直连对端 + 代理头」推出登录锁定用的来源 IP。
+///
+/// ── 为什么不能直接用对端地址（2026-09-30 修正）──────────────
+/// 容器 / 反向代理部署下，所有请求的对端都是**同一个**代理地址（Docker 里是
+/// 网桥网关，nginx 场景是宿主地址）。按对端地址计失败次数，等于把所有访问者
+/// 合并进同一个桶：随便一个人连错几次密码，**管理员自己也会被锁在门外** ——
+/// 正是本模块注释里说要避免的那种情况。
+///
+/// ── 为什么不是无条件信任代理头 ─────────────────────────────
+/// 代理头是客户端可伪造的。无条件采信等于给攻击者一个「换个头就重置计数」的
+/// 开关，比不修更糟。因此只在**对端本身是 loopback / 私有地址**时才采信；
+/// 对端是公网地址时，它自己就是真实客户端，代理头一概忽略。
+pub fn login_source_ip(peer: IpAddr, real_ip: Option<&str>, forwarded_for: Option<&str>) -> IpAddr {
+    if !trust_proxy_headers() || !is_private_peer(peer) {
+        return peer;
+    }
+    // X-Real-IP 由代理直接写入、语义无歧义，优先采信
+    if let Some(ip) = real_ip.and_then(|value| value.trim().parse::<IpAddr>().ok()) {
+        return ip;
+    }
+    // 退回 X-Forwarded-For 的**最后一段**：nginx 用 `$proxy_add_x_forwarded_for`
+    // 追加，客户端伪造的段只会排在前面，最后一段才是代理看到的真实来源
+    if let Some(ip) = forwarded_for
+        .and_then(|value| value.split(',').next_back())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok())
+    {
+        return ip;
+    }
+    peer
 }
 
 // ── /v1 fail-closed（headless 未配 Key 时拒绝转发，见 bin）────

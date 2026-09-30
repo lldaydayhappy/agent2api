@@ -122,10 +122,24 @@ pub fn challenge() -> Option<Value> {
             Err(poisoned) => poisoned.into_inner(),
         };
         let now = now_ms();
-        // 顺手清过期 + 超容量时先扔最早过期的（容量只是防御性的兜底）
+        // 顺手清过期
         table.retain(|_, expires| *expires > now);
+        // 超容量时**按到期时间淘汰最早的一批**，而不是整表清空。
+        //
+        // 2026-09-30 修正：原实现是 `table.retain(|_, _| false)`，一次把
+        // 所有已签发但尚未使用的题全部作废 —— 正在登录的人会突然收到
+        // 「校验已过期」，而容量只是防御性兜底，不该造成这种可见故障。
+        // 这里改成淘汰最早到期的一半，让在途的题尽量活到自然过期。
         if table.len() >= STORE_CAP {
-            table.retain(|_, _| false);
+            let overflow = table.len() - STORE_CAP / 2;
+            let mut by_expiry: Vec<(String, i64)> = table
+                .iter()
+                .map(|(key, expires)| (key.clone(), *expires))
+                .collect();
+            by_expiry.sort_unstable_by_key(|(_, expires)| *expires);
+            for (key, _) in by_expiry.into_iter().take(overflow) {
+                table.remove(&key);
+            }
         }
         table.insert(challenge_hex.clone(), now + CHALLENGE_TTL_MS);
     }
