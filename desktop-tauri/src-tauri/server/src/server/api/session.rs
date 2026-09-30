@@ -859,6 +859,39 @@ pub async fn login_autoclaw_oauth_callback(
     let Some(vendor) = Vendor::from_id(vendor_id.trim()) else {
         return oauth_callback_page(400, "登录失败：无法识别的登录方式");
     };
+    // ── 远程 / 容器部署下**拒绝**这条公开路由（2026-09-30 安全加固）──
+    //
+    // 本路由挂在 public 组（调用方是用户的浏览器，它当然没有 API Key），
+    // 而回调与登录任务的关联是「同变体里**最近发起**的那一条」—— 回调 URL 里
+    // 不带我们自己的 state（上游会在 `navigate_uri` 后拼它自己生成的 state，
+    // 放我们的会被撞参数名，见 `providers::autoclaw::oauth` 的说明）。
+    //
+    // 桌面形态下这个取舍是成立的：`navigate_uri` 指向本机 loopback，能打到它的
+    // 只有本机进程。但**容器 / 远程部署下这条路由是公网可达的**，威胁模型不成立：
+    // 管理员点「登录」之后、浏览器跳回来之前的那几秒里，任何能访问面板的人
+    // 只要抢先请求 `/auth/callback-zai?code=<自己的>&state=<任意>`，网关就会用
+    // 攻击者的授权码换码成功、把**攻击者的账号**写成网关登录态 —— 此后管理员
+    // 的所有请求都跑在攻击者账号上。
+    //
+    // 而远程形态下这条路由**本来就没有正当用途**：`navigate_uri` 被上游白名单
+    // 钉死在 `http://localhost:<端口>`，浏览器把它解析成**用户自己那台机器**，
+    // 永远打不到网关。远程部署的正路是「粘贴回调」（`POST /api/session/login/callback`，
+    // 那条是**要鉴权**的）。因此这里直接按监听地址关掉：绑 loopback（桌面壳 /
+    // 本机 headless）才处理，否则只回一页指引，**不碰 code**。
+    if !state.host.is_loopback() {
+        logging::log(
+            "[Security]",
+            &format!(
+                "⛔ 拒绝公网回调 {vendor_id}（本部署监听 {}，非 loopback）：远程形态请改用面板的「粘贴回调地址」",
+                state.host
+            ),
+        );
+        return oauth_callback_page(
+            400,
+            "登录失败：本网关部署在远程，浏览器打不开 localhost 回调。\
+             请回到面板，用登录窗口里的「粘贴回调地址」完成登录。",
+        );
+    }
     let code = params.get("code").cloned().unwrap_or_default();
     // 上游在查询串里回的 state —— 换码要用的就是这一个（官方客户端读的也是它）
     let upstream_state = params.get("state").cloned().unwrap_or_default();

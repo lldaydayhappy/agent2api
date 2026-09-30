@@ -415,7 +415,8 @@ pub async fn refresh(
         machine_id: &credentials.machine_id,
     };
     // 目录是 GET：请求体为空，签名覆盖空体（源实现传 null 同上）
-    let headers = match cosy::build_auth_headers(None, &url, &identity) {
+    let headers = match cosy::build_auth_headers_with(region.cosy_profile(), None, &url, &identity)
+    {
         Ok(headers) => headers,
         Err(error) => return ModelRefreshOutcome::failed(error.message),
     };

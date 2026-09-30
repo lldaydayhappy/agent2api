@@ -8,6 +8,25 @@ use crate::server::errors::GatewayError;
 pub enum Region {
     Global,
     Cn,
+    // ── 关于「千问办公 QwenWork」（2026-09-30 调研结论，尚未接线）────
+    //
+    // 调研确认它与 Qoder 是**同一套协议**：推理端点同为
+    // `{gateway}algo/api/v2/service/pro/sse/agent_chat_generation`；鉴权同为 COSY
+    // 自签名且 **RSA 公钥逐字节相同**（模数 `c0f223…`）；响应同为
+    // 「外层信封 `{statusCodeValue, body}`，内层才是 OpenAI chunk」；续期端点同为
+    // `/api/v1/deviceToken/refresh`。千问办公在客户端里的内部代号本来就是 Qoder
+    // （BundleID `cn.qwenwork.desktop.mac`，资源含 `qoder-auth-wasm`）。
+    //
+    // 因此接入它的正确做法是**在本枚举里加一个 `QwenWork` 变体**（主机名
+    // `gateway.qwenwork.cn` + `cosy::QWENWORK_PROFILE`），而不是另写一家 provider。
+    //
+    // **本次未做**：主机名 / 设备授权路径 / 模型清单都只有第三方逆向记录、
+    // 未经本项目对真实账号验证；而加变体要同步扩 `CatalogState` 与十余处 match，
+    // 在拿不到账号联调的前提下写进去等于交付一份猜出来的实现。等拿到千问办公
+    // 账号、把下列三点核实后再加：
+    //   1. `open_api()` / `web_origin()` 的真实主机（逆向记录只给了推理网关）；
+    //   2. 设备授权的登录路径（逆向记录只覆盖了续期端点）；
+    //   3. `algo/api/v2/model/list` 的真实返回，用于替换静态兜底表。
 }
 
 impl Region {
@@ -109,6 +128,18 @@ impl Region {
                     "https://api3.qoder.sh/"
                 }
             }
+        }
+    }
+
+    /// 本地区用的 COSY 配置档（见 `cosy::CosyProfile`）。
+    ///
+    /// 目前两个地区共用 `QODER_PROFILE`（既有行为逐字不变）。这层间接是为
+    /// 「千问办公」准备的 —— 它与 Qoder 同一套协议、只有几个 COSY 字面常量不同
+    /// （见 `cosy::QWENWORK_PROFILE`），接线时只需在这里多一个分支，
+    /// 而不必把 360 行密码学实现复制第二份。
+    pub fn cosy_profile(self) -> &'static super::cosy::CosyProfile {
+        match self {
+            Self::Global | Self::Cn => &super::cosy::QODER_PROFILE,
         }
     }
 }

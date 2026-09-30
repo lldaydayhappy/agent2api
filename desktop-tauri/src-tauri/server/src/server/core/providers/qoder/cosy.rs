@@ -63,6 +63,70 @@ const MACHINE_TYPE: &str = "5";
 /// `Cosy-Clientip`：本机回环（源实现写死该值）
 const CLIENT_IP: &str = "127.0.0.1";
 
+/// 一次 COSY 签名中**随产品线变化**的那几个常量。
+///
+/// ── 为什么要有这个结构（2026-09-30）─────────────────────────
+/// 「千问办公 QwenWork」与 Qoder 是**同一套 COSY 协议**：RSA 公钥逐字节相同
+/// （模数 `c0f223…`，已核对）、`Cosy-Key` / `Authorization` 的构造方式、
+/// 签名串格式、`Cosy-*` 头名全部一致 —— 千问办公在客户端里的内部代号本来
+/// 就是 Qoder（BundleID `cn.qwenwork.desktop.mac`，资源含 `qoder-auth-wasm`）。
+///
+/// 两边的差异只有几个字面常量（协议版本号、Clienttype，以及千问办公多发的
+/// 三个业务头）。把这些抽出来，两个 provider 就能共用同一份**已被 Node 逐字节
+/// 对拍验证过**的签名实现，而不是把 360 行密码学代码复制第二份 ——
+/// 复制出去的那份一旦上游改口径，就会出现「改了一处、漏了另一处」。
+pub struct CosyProfile {
+    /// `Cosy-Version` 与 payload 里的 `cosyVersion`（**随客户端版本漂移**）
+    pub cosy_version: &'static str,
+    /// `Cosy-Clienttype`
+    pub client_type: &'static str,
+    /// `Cosy-Machinetype`
+    pub machine_type: &'static str,
+    /// `Cosy-Data-Policy`
+    pub data_policy: &'static str,
+    /// `Login-Version`
+    pub login_version: &'static str,
+    /// `Cosy-Business-Product`（Qoder 不发该头时为 None）
+    pub business_product: Option<&'static str>,
+    /// `Cosy-Business-Type`（同上）
+    pub business_type: Option<&'static str>,
+    /// `Cosy-Scene`（同上）
+    pub scene: Option<&'static str>,
+}
+
+/// Qoder 的配置档（与既有行为**逐字一致** —— 新增字段全为 None）
+pub const QODER_PROFILE: CosyProfile = CosyProfile {
+    cosy_version: GATEWAY_COSY_VERSION,
+    client_type: CLIENT_TYPE,
+    machine_type: MACHINE_TYPE,
+    data_policy: DATA_POLICY,
+    login_version: LOGIN_VERSION,
+    business_product: None,
+    business_type: None,
+    scene: None,
+};
+
+/// 千问办公（QwenWork）的配置档。
+///
+/// ⚠️ **当前未被引用**（千问办公尚未接线，见 `endpoints::Region` 的说明）。
+/// 保留它是为了让接线时只需在 `Region::cosy_profile()` 里多一个分支 ——
+/// 常量本身来自第三方逆向记录，未与真实账号核对。
+///
+/// ⚠️ **`cosy_version` 随客户端版本漂移**（逆向记录：0.1.3 → `1.0.47`，
+/// 1.0.4 → `1.1.32`）。这里取较新的 `1.1.32`；上游升级客户端后需要同步更新，
+/// 否则会签名/版本校验失败。
+#[allow(dead_code)]
+pub const QWENWORK_PROFILE: CosyProfile = CosyProfile {
+    cosy_version: "1.1.32",
+    client_type: "6",
+    machine_type: "5",
+    data_policy: "disagree",
+    login_version: "v2",
+    business_product: Some("qoder_work"),
+    business_type: Some("agent"),
+    scene: Some("qwork"),
+};
+
 /// COSY 身份加密用的 RSA 公钥模数（1024 位，hex，无前导零）。
 ///
 /// 这是**客户端内置的固定公钥**（源实现 `RSA_PUBLIC_KEY` 的 PEM 正文），
@@ -101,6 +165,20 @@ pub struct CosyIdentity<'a> {
 /// 所以调用方必须先 `encode_body` 再调本函数 —— 顺序颠倒会得到一个
 /// 「签名不匹配」的上游错误，且无法从错误里看出原因。
 pub fn build_auth_headers(
+    body: Option<&[u8]>,
+    request_url: &str,
+    identity: &CosyIdentity<'_>,
+) -> Result<Vec<(String, String)>, GatewayError> {
+    build_auth_headers_with(&QODER_PROFILE, body, request_url, identity)
+}
+
+/// 与 [`build_auth_headers`] **同一实现**，但用调用方给的配置档。
+///
+/// 千问办公（QwenWork）走这条 —— 两边协议一致、只有几个字面常量不同，
+/// 见 [`CosyProfile`] 的说明。`build_auth_headers` 保留为 Qoder 的入口，
+/// 于是既有调用点一行都不用改。
+pub fn build_auth_headers_with(
+    profile: &CosyProfile,
     body: Option<&[u8]>,
     request_url: &str,
     identity: &CosyIdentity<'_>,
@@ -149,7 +227,8 @@ pub fn build_auth_headers(
     // 都不需要转义。
     let payload_src = format!(
         "{{\"version\":\"v1\",\"requestId\":\"{request_id}\",\"info\":\"{info}\",\
-         \"cosyVersion\":\"{GATEWAY_COSY_VERSION}\",\"ideVersion\":\"\"}}"
+         \"cosyVersion\":\"{}\",\"ideVersion\":\"\"}}",
+        profile.cosy_version
     );
     let payload = base64::engine::general_purpose::STANDARD.encode(payload_src.as_bytes());
 
@@ -173,7 +252,7 @@ pub fn build_auth_headers(
     body_hasher.update(body_bytes);
     let body_hash = format!("{:x}", body_hasher.finalize());
 
-    let headers: Vec<(String, String)> = vec![
+    let mut headers: Vec<(String, String)> = vec![
         (
             "Authorization".to_string(),
             format!("Bearer COSY.{payload}.{signature}"),
@@ -181,22 +260,33 @@ pub fn build_auth_headers(
         ("Cosy-Key".to_string(), cosy_key),
         ("Cosy-User".to_string(), identity.user_id.to_string()),
         ("Cosy-Date".to_string(), timestamp),
-        ("Cosy-Version".to_string(), GATEWAY_COSY_VERSION.to_string()),
+        ("Cosy-Version".to_string(), profile.cosy_version.to_string()),
         ("Cosy-Machineid".to_string(), identity.machine_id.to_string()),
         ("Cosy-Machinetoken".to_string(), identity.machine_id.to_string()),
-        ("Cosy-Machinetype".to_string(), MACHINE_TYPE.to_string()),
+        ("Cosy-Machinetype".to_string(), profile.machine_type.to_string()),
         ("Cosy-Machineos".to_string(), machine_os()),
-        ("Cosy-Clienttype".to_string(), CLIENT_TYPE.to_string()),
+        ("Cosy-Clienttype".to_string(), profile.client_type.to_string()),
         ("Cosy-Clientip".to_string(), CLIENT_IP.to_string()),
         ("Cosy-Bodyhash".to_string(), body_hash),
         ("Cosy-Bodylength".to_string(), body_bytes.len().to_string()),
         ("Cosy-Sigpath".to_string(), sig_path),
-        ("Cosy-Data-Policy".to_string(), DATA_POLICY.to_string()),
+        ("Cosy-Data-Policy".to_string(), profile.data_policy.to_string()),
         ("Cosy-Organization-Id".to_string(), String::new()),
         ("Cosy-Organization-Tags".to_string(), String::new()),
-        ("Login-Version".to_string(), LOGIN_VERSION.to_string()),
+        ("Login-Version".to_string(), profile.login_version.to_string()),
         ("X-Request-Id".to_string(), request_id),
     ];
+    // 千问办公多发三个业务头（Qoder 的配置档里是 None，一个都不加 ——
+    // 保证既有 Qoder 请求的头部集合逐字不变）
+    for (name, value) in [
+        ("Cosy-Business-Product", profile.business_product),
+        ("Cosy-Business-Type", profile.business_type),
+        ("Cosy-Scene", profile.scene),
+    ] {
+        if let Some(value) = value {
+            headers.push((name.to_string(), value.to_string()));
+        }
+    }
     Ok(headers)
 }
 

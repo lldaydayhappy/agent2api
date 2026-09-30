@@ -239,7 +239,13 @@ pub fn build_plan(
         email: &credentials.email,
         machine_id: &credentials.machine_id,
     };
-    let mut headers = cosy::build_auth_headers(Some(&encoded), &url, &identity)?;
+    // 配置档按地区取（Qoder 两地区用同一份；千问办公用自己那份，见 CosyProfile）
+    let mut headers = cosy::build_auth_headers_with(
+        credentials.region.cosy_profile(),
+        Some(&encoded),
+        &url,
+        &identity,
+    )?;
     headers.push(("Content-Type".to_string(), "application/json".to_string()));
     headers.push(("Accept".to_string(), "text/event-stream".to_string()));
     headers.push(("Cache-Control".to_string(), "no-cache".to_string()));
