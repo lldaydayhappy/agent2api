@@ -1,7 +1,18 @@
 # 修复与改进（2026-09-30）
 
 针对代码审查中发现的缺陷做了一批修复，全部为**最小改动面**，不改变任何对外接口与落盘契约。
-已通过 `cargo check -p agent2api-server`（零错误零警告）。
+
+**验证结果**（在 `rust:1-bookworm` 容器内，与项目 Dockerfile 同环境）：
+
+```
+cargo check -p agent2api-server
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9m 21s
+    0 error / 0 warning
+
+cargo test -p agent2api-server --lib
+    running 258 tests
+    test result: ok. 253 passed; 0 failed; 5 ignored; finished in 4.08s
+```
 
 ## 🔴 安全
 
