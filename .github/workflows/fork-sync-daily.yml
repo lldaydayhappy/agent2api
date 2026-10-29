@@ -98,24 +98,39 @@ jobs:
 
           msg = res.get("message", "")
           print(f"message: {msg}")
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          def note(text):
+              print(text)
+              if summary:
+                  with open(summary, "a") as fh:
+                      fh.write(text + "\n")
+
           if st == 409:
               title = f"fork-sync: manual conflict on `{br}`"
-              st2, issues = call("GET", f"/repos/{repo}/issues?state=open&labels=fork-sync&per_page=50")
-              existing = [i for i in (issues if isinstance(issues, list) else []) if i.get("title") == title]
               body = (
                   f"Daily upstream sync failed with a merge conflict.\n\n"
                   f"- upstream: `{parent}:{pbr}`\n"
                   f"- branch: `{br}`\n"
                   f"- behind {behind}, ahead {ahead}\n\n"
-                  f"Resolve locally:\n\n```\ngit fetch upstream && git merge upstream/{pbr}\n"
+                  f"Resolve locally:\n\n```\ngit remote add upstream https://github.com/{parent}.git\n"
+                  f"git fetch upstream && git merge upstream/{pbr}\n"
                   f"# fix conflicts, commit, push\n```"
               )
-              if existing:
-                  print(f"conflict issue already open: {existing[0]['html_url']}")
+              note(f"## fork-sync conflict on `{br}`\n\nupstream `{parent}:{pbr}` — behind {behind}, ahead {ahead}\n\n"
+                   f"```\ngit fetch upstream && git merge upstream/{pbr}\n# fix conflicts, commit, push\n```")
+              st2, issues = call("GET", f"/repos/{repo}/issues?state=open&labels=fork-sync&per_page=50")
+              if st2 == 200:
+                  existing = [i for i in (issues if isinstance(issues, list) else []) if i.get("title") == title]
+                  if existing:
+                      note(f"conflict issue already open: {existing[0]['html_url']}")
+                  else:
+                      st3, _ = call("POST", f"/repos/{repo}/issues", {"title": title, "body": body, "labels": ["fork-sync"]})
+                      note(f"opened conflict issue: HTTP {st3}")
               else:
-                  st3, _ = call("POST", f"/repos/{repo}/issues", {"title": title, "body": body, "labels": ["fork-sync"]})
-                  print(f"opened conflict issue: HTTP {st3}")
+                  note("issues disabled on this repo (HTTP %s) — reporting in job summary only" % st2)
               sys.exit(1)
 
-          sys.exit(f"merge-upstream failed: {st} {msg}")
+          note(f"merge-upstream failed: {st} {msg}")
+          sys.exit(1)
           PY
