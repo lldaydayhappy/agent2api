@@ -119,14 +119,14 @@ jobs:
               )
               note(f"## fork-sync conflict on `{br}`\n\nupstream `{parent}:{pbr}` — behind {behind}, ahead {ahead}\n\n"
                    f"```\ngit fetch upstream && git merge upstream/{pbr}\n# fix conflicts, commit, push\n```")
-              st2, issues = call("GET", f"/repos/{repo}/issues?state=open&labels=fork-sync&per_page=50")
+              st2, issues = call("GET", f"/repos/{repo}/issues?state=open&per_page=100")
               if st2 == 200:
                   existing = [i for i in (issues if isinstance(issues, list) else []) if i.get("title") == title]
                   if existing:
                       note(f"conflict issue already open: {existing[0]['html_url']}")
                   else:
-                      st3, _ = call("POST", f"/repos/{repo}/issues", {"title": title, "body": body, "labels": ["fork-sync"]})
-                      note(f"opened conflict issue: HTTP {st3}")
+                      st3, res3 = call("POST", f"/repos/{repo}/issues", {"title": title, "body": body})
+                      note(f"opened conflict issue: HTTP {st3} {res3.get('html_url', '')}")
               else:
                   note("issues disabled on this repo (HTTP %s) — reporting in job summary only" % st2)
               sys.exit(1)
