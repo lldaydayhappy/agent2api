@@ -27,6 +27,7 @@ jobs:
       - name: Merge upstream into fork
         env:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.UPSTREAM_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          FALLBACK_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.event.repository.default_branch }}
           DRY_RUN: ${{ inputs.dry_run }}
@@ -35,15 +36,16 @@ jobs:
           import json, os, sys, urllib.request, urllib.error
 
           tok   = os.environ["GH_TOKEN"]
+          fb    = os.environ.get("FALLBACK_TOKEN") or ""
           repo  = os.environ["REPO"]
           br    = os.environ.get("BRANCH") or "main"
           dry   = (os.environ.get("DRY_RUN") or "").lower() in ("1", "true")
           API   = "https://api.github.com"
 
-          def call(method, path, body=None):
+          def _raw(method, path, body, token):
               data = json.dumps(body).encode() if body is not None else None
               req = urllib.request.Request(API + path, data=data, method=method)
-              req.add_header("Authorization", "Bearer " + tok)
+              req.add_header("Authorization", "Bearer " + token)
               req.add_header("Accept", "application/vnd.github+json")
               req.add_header("X-GitHub-Api-Version", "2022-11-28")
               req.add_header("User-Agent", "fork-sync-daily")
@@ -59,6 +61,17 @@ jobs:
                   except Exception:
                       return e.code, {"message": raw.decode(errors="replace")[:400]}
 
+          def call(method, path, body=None):
+              global tok
+              st, data = _raw(method, path, body, tok)
+              if st == 401 and fb and tok != fb:
+                  print("primary token rejected (401) -> falling back to GITHUB_TOKEN")
+                  tok = fb
+                  st, data = _raw(method, path, body, tok)
+              return st, data
+
+          print(f"auth      : {'github.token' if tok == fb else 'repo secret'}")
+
           st, info = call("GET", f"/repos/{repo}")
           if st != 200:
               sys.exit(f"cannot read repo info: {st} {info}")
@@ -66,8 +79,11 @@ jobs:
               print("not a fork, nothing to sync")
               sys.exit(0)
 
-          parent = info["parent"]["full_name"]
-          pbr    = info["parent"]["default_branch"]
+          parent = (info.get("parent") or {}).get("full_name")
+          pbr    = (info.get("parent") or {}).get("default_branch")
+          if not parent:
+              print("fork has no upstream parent (detached), nothing to sync")
+              sys.exit(0)
           owner  = info["owner"]["login"]
 
           st, cmp = call("GET", f"/repos/{parent}/compare/{pbr}...{owner}:{br}")
