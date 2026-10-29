@@ -1,0 +1,121 @@
+name: Fork Sync (daily)
+
+on:
+  schedule:
+    - cron: '17 19 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only report divergence, do not merge'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync fork branch from upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Merge upstream into fork
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.UPSTREAM_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, urllib.request, urllib.error
+
+          tok   = os.environ["GH_TOKEN"]
+          repo  = os.environ["REPO"]
+          br    = os.environ.get("BRANCH") or "main"
+          dry   = (os.environ.get("DRY_RUN") or "").lower() in ("1", "true")
+          API   = "https://api.github.com"
+
+          def call(method, path, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(API + path, data=data, method=method)
+              req.add_header("Authorization", "Bearer " + tok)
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("X-GitHub-Api-Version", "2022-11-28")
+              req.add_header("User-Agent", "fork-sync-daily")
+              if data:
+                  req.add_header("Content-Type", "application/json")
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      return r.status, json.loads(r.read() or b"{}")
+              except urllib.error.HTTPError as e:
+                  raw = e.read()
+                  try:
+                      return e.code, json.loads(raw or b"{}")
+                  except Exception:
+                      return e.code, {"message": raw.decode(errors="replace")[:400]}
+
+          st, info = call("GET", f"/repos/{repo}")
+          if st != 200:
+              sys.exit(f"cannot read repo info: {st} {info}")
+          if not info.get("fork"):
+              print("not a fork, nothing to sync")
+              sys.exit(0)
+
+          parent = info["parent"]["full_name"]
+          pbr    = info["parent"]["default_branch"]
+          owner  = info["owner"]["login"]
+
+          st, cmp = call("GET", f"/repos/{parent}/compare/{pbr}...{owner}:{br}")
+          if st != 200:
+              print(f"compare unavailable ({st}), trying merge anyway")
+              behind = ahead = None
+          else:
+              behind, ahead = cmp.get("behind_by", 0), cmp.get("ahead_by", 0)
+
+          print(f"repo      : {repo}")
+          print(f"branch    : {br}")
+          print(f"upstream  : {parent}:{pbr}")
+          if behind is not None:
+              print(f"divergence: behind {behind}, ahead {ahead}")
+
+          if behind == 0:
+              print("already up to date")
+              sys.exit(0)
+          if dry:
+              print("dry run: skipping merge")
+              sys.exit(0)
+
+          st, res = call("POST", f"/repos/{repo}/merge-upstream", {"branch": br})
+          print(f"merge-upstream -> HTTP {st}")
+          if st == 200:
+              print(json.dumps({"merge_type": res.get("merge_type"), "base_branch": res.get("base_branch")}))
+              sys.exit(0)
+
+          msg = res.get("message", "")
+          print(f"message: {msg}")
+          if st == 409:
+              title = f"fork-sync: manual conflict on `{br}`"
+              st2, issues = call("GET", f"/repos/{repo}/issues?state=open&labels=fork-sync&per_page=50")
+              existing = [i for i in (issues if isinstance(issues, list) else []) if i.get("title") == title]
+              body = (
+                  f"Daily upstream sync failed with a merge conflict.\n\n"
+                  f"- upstream: `{parent}:{pbr}`\n"
+                  f"- branch: `{br}`\n"
+                  f"- behind {behind}, ahead {ahead}\n\n"
+                  f"Resolve locally:\n\n```\ngit fetch upstream && git merge upstream/{pbr}\n"
+                  f"# fix conflicts, commit, push\n```"
+              )
+              if existing:
+                  print(f"conflict issue already open: {existing[0]['html_url']}")
+              else:
+                  st3, _ = call("POST", f"/repos/{repo}/issues", {"title": title, "body": body, "labels": ["fork-sync"]})
+                  print(f"opened conflict issue: HTTP {st3}")
+              sys.exit(1)
+
+          sys.exit(f"merge-upstream failed: {st} {msg}")
+          PY
