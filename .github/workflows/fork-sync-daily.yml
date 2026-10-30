@@ -2,7 +2,10 @@ name: Fork Sync (daily)
 
 on:
   schedule:
-    - cron: '17 19 * * *'
+    # 每 2 小时试一次，一天 12 次机会。幂等：behind=0 时 4 秒空转退出。
+    # GitHub 的 cron 延迟/丢单是常态（实测延迟可达 3 小时），高频重试是唯一
+    # 不依赖外部服务就能把「每天至少成功一次」压到接近确定的办法。
+    - cron: '17 */2 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -33,7 +36,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           python3 - <<'PY'
-          import json, os, sys, urllib.request, urllib.error
+          import json, os, sys, time, socket, urllib.request, urllib.error
 
           tok   = os.environ["GH_TOKEN"]
           fb    = os.environ.get("FALLBACK_TOKEN") or ""
@@ -62,13 +65,27 @@ jobs:
                       return e.code, {"message": raw.decode(errors="replace")[:400]}
 
           def call(method, path, body=None):
+              """带三层韧性：网络/5xx 重试 -> 401 换 github.token -> 回落最后结果。"""
               global tok
-              st, data = _raw(method, path, body, tok)
-              if st == 401 and fb and tok != fb:
-                  print("primary token rejected (401) -> falling back to GITHUB_TOKEN")
-                  tok = fb
-                  st, data = _raw(method, path, body, tok)
-              return st, data
+              last = (0, {"message": "no attempt made"})
+              for attempt in range(4):
+                  try:
+                      st, data = _raw(method, path, body, tok)
+                  except Exception as e:
+                      st, data = 0, {"message": f"transport error: {e.__class__.__name__}: {e}"}
+                  if st == 401 and fb and tok != fb:
+                      print("primary token rejected (401) -> falling back to GITHUB_TOKEN")
+                      tok = fb
+                      continue
+                  if st == 0 or st == 429 or 500 <= st < 600:
+                      last = (st, data)
+                      if attempt < 3:
+                          wait = 2 ** attempt
+                          print(f"transient failure (HTTP {st or 'transport'}), retry in {wait}s")
+                          time.sleep(wait)
+                          continue
+                  return st, data
+              return last
 
           print(f"auth      : {'github.token' if tok == fb else 'repo secret'}")
 
