@@ -36,6 +36,8 @@
 //! 要么全不成 —— 中断留下「部分账号改了 id、部分没改」的中间态会让同一批
 //! 账号散在两个 provider 组里。
 
+use std::collections::{HashMap, HashSet};
+
 use serde_json::{json, Map, Value};
 
 use crate::server::config;
@@ -53,6 +55,105 @@ use crate::server::logging;
 
 impl AccountStore {
     // ─── 凭证回写与限额标记 ──────────────────────────────────
+
+    /// 标记 / 清除账号的「需要重新登录」状态（`needsRelogin` + `needsReloginReason`）。
+    ///
+    /// ── 这个标记解决什么（issue #215）────────────────────────────
+    /// 上游把会话连同 refresh token 一起注销（12153）之后，网关侧再刷多少次都
+    /// 不会好。没有这个标记时，凭证维护每轮重试、每轮失败，日志刷屏，而用户
+    /// 始终不知道「该去重新登录」。标记之后：
+    ///   - 凭证维护跳过它（不再白打上游）；
+    ///   - 界面显示「需要重新登录」而不是「刷新失败」；
+    ///   - 用户重新登录成功时清掉（见 `AuthService::clear_needs_relogin`）。
+    ///
+    /// `reason` 给 `None` = 清除标记。账号不存在返回 false。
+    pub fn set_needs_relogin(&self, id: &str, reason: Option<&str>) -> bool {
+        let _guard = self.guard();
+        let Some(mut record) = self.record_by_id(&_guard, id) else {
+            return false;
+        };
+        match reason.filter(|text| !text.is_empty()) {
+            Some(reason) => {
+                record.set("needsRelogin", Value::Bool(true));
+                record.set("needsReloginReason", Value::String(reason.to_string()));
+            }
+            None => {
+                record.remove("needsRelogin");
+                record.remove("needsReloginReason");
+            }
+        }
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))
+            .is_ok()
+    }
+
+    pub fn suspend_upstream_account(&self, id: &str, reason: &str) -> Result<(), String> {
+        let guard = self.guard();
+        let mut record = self.record_by_id(&guard, id).ok_or_else(|| "账号不存在".to_string())?;
+        record.set_enabled(false);
+        record.set("upstreamBlockedReason", Value::String(truncate_chars(reason, 300)));
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record)).map_err(|error| error.to_string())
+    }
+
+    pub fn cooldown_upstream_account(&self, id: &str, until: i64, reason: &str) -> Result<(), String> {
+        let guard = self.guard();
+        let mut record = self.record_by_id(&guard, id).ok_or_else(|| "账号不存在".to_string())?;
+        if until <= logging::now_ms() { return Ok(()); }
+        record.set("upstreamCooldownUntil", Value::from(until));
+        record.set("upstreamBlockedReason", Value::String(truncate_chars(reason, 300)));
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record)).map_err(|error| error.to_string())
+    }
+
+    /// 账号是否被标记为「需要重新登录」（凭证维护据此跳过）。
+    pub fn needs_relogin(&self, id: &str) -> bool {
+        self.read_record(id).and_then(|record| record.get("needsRelogin").and_then(Value::as_bool))
+            .unwrap_or(false)
+    }
+
+    /// 记一次「上游回了 12153」并返回**累计次数**（账号不存在返回 0）。
+    ///
+    /// ── 为什么不是一次就判死（issue #215 评论区的实测教训）────────
+    /// 参考项目（workbuddy2api-panel）在自己的注释里记了这条：旧实现「一次 12153
+    /// 即 Disable」，事后排查发现**13 个被禁用的号全部 refresh 成功** —— 它们都是
+    /// 误判的受害者。12153 会被网络抖动、上游闪断、refresh 竞态临时触发，一次失败
+    /// 就永久杀号会误杀健康账号。
+    ///
+    /// 因此这里只累计、不判定；阈值判断留在调用方（`AuthService`），
+    /// 达阈值才标 `needsRelogin`。
+    pub fn note_refresh_token_invalid(&self, id: &str) -> i64 {
+        let _guard = self.guard();
+        let Some(mut record) = self.record_by_id(&_guard, id) else {
+            return 0;
+        };
+        let streak = record
+            .get("refreshTokenInvalidStreak")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .saturating_add(1);
+        record.set("refreshTokenInvalidStreak", Value::from(streak));
+        record.set_updated_at(logging::now_ms());
+        let _ = self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record));
+        streak
+    }
+
+    /// 清掉 12153 连续计数（刷新成功 = 账号被证明还活着）。
+    ///
+    /// 与 `note_refresh_token_invalid` 成对：只要有一次刷新成功，就说明
+    /// 之前那些 12153 都是抖动，计数归零，避免「隔几天抖一次」慢慢攒到阈值。
+    pub fn clear_refresh_token_invalid(&self, id: &str) {
+        let _guard = self.guard();
+        let Some(mut record) = self.record_by_id(&_guard, id) else {
+            return;
+        };
+        if record.get("refreshTokenInvalidStreak").is_none() {
+            return;
+        }
+        record.remove("refreshTokenInvalidStreak");
+        record.set_updated_at(logging::now_ms());
+        let _ = self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record));
+    }
 
     /// 账号刷新成功后回写新 token（账号不存在返回 false）
     pub fn update_account_tokens(
@@ -146,6 +247,11 @@ impl AccountStore {
     ///
     /// 冷却键形态见 `mark_rate_limited`：键在账号记录内，provider 由账号唯一确定。
     pub fn clear_rate_limit(&self, id: &str, model: &str) -> bool {
+        if !self.route_account(id).is_some_and(|account| {
+            account.get("rateLimits").and_then(|limits| limits.get(model)).is_some()
+        }) {
+            return false;
+        }
         let _guard = self.guard();
         let Some(mut record) = self.record_by_id(&_guard, id) else {
             return false;
@@ -178,11 +284,13 @@ impl AccountStore {
         let count = match record.get("rateLimits") {
             Some(Value::Object(limits)) => limits.len(),
             _ => 0,
-        };
+        } + usize::from(record.get("upstreamCooldownUntil").is_some());
         if count == 0 {
             return 0;
         }
         record.remove("rateLimits");
+        record.remove("upstreamCooldownUntil");
+        if record.enabled() { record.remove("upstreamBlockedReason"); }
         record.set_updated_at(logging::now_ms());
         if self
             .with_conn(&_guard, |conn| sql::update_in_place(conn, &record))
@@ -351,6 +459,68 @@ impl AccountStore {
         cleaned
     }
 
+    /// Trae 历史模型 ID 清理：账号上的限额冷却键、限制器条件里的模型名
+    /// 按目录缓存给出的旧名映射改成原始 ID。
+    ///
+    /// 只处理 provider 为 `trae` 的记录；**只改映射里确实出现过的旧名**，
+    /// 不按后缀猜——上游真名恰好以 `-solo` 结尾时不能被误伤。
+    /// 一次读、一次差异写（与 `migrate_startup` 同一取向）；没有改动时不落库。
+    pub fn migrate_trae_model_ids(&self, mapping: &HashMap<String, String>) -> usize {
+        if mapping.is_empty() {
+            return 0;
+        }
+        let _guard = self.guard();
+        let mut state = self.load(&_guard);
+        let now = logging::now_ms();
+        let mut changed = 0usize;
+        for record in state.accounts.iter_mut() {
+            if !record.provider().eq_ignore_ascii_case("trae") {
+                continue;
+            }
+            let mut touched = false;
+            if let Some(Value::Object(limits)) = record.get("rateLimits").cloned() {
+                let mut next = Map::new();
+                for (key, value) in limits {
+                    let base = mapping.get(&key.trim().to_ascii_lowercase());
+                    if base.is_some() {
+                        touched = true;
+                    }
+                    next.entry(base.cloned().unwrap_or(key)).or_insert(value);
+                }
+                if touched {
+                    if next.is_empty() {
+                        record.remove("rateLimits");
+                    } else {
+                        record.set("rateLimits", Value::Object(next));
+                    }
+                }
+            }
+            for field in ["limiterGroups", "limiters"] {
+                let Some(mut value) = record.get(field).cloned() else {
+                    continue;
+                };
+                if rewrite_models_arrays(&mut value, mapping) {
+                    record.set(field, value);
+                    touched = true;
+                }
+            }
+            if touched {
+                record.set_updated_at(now);
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            if let Err(error) = self.save(&state, &_guard) {
+                logging::log(
+                    "[Accounts]",
+                    &format!("❌ Trae 旧模型 ID 迁移落库失败（下次启动会重试）: {error}"),
+                );
+                return 0;
+            }
+        }
+        changed
+    }
+
     /// 记录账号**今天已签到**（登录页那枚按钮据此置灰）。
     ///
     /// `at` 是这次签到成功的毫秒时间戳。判定「今天签过没」由**读侧**按自然日比
@@ -370,6 +540,34 @@ impl AccountStore {
         // 注意**不**动 updatedAt：那是「记录被改过」的时间，会显示在账号页的
         // 「更新于 …」上；签到不是用户改配置那种「更新」，写进去会让这一栏
         // 在每天自动签到后集体跳动一次。
+        self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))
+            .is_ok()
+    }
+
+    /// 记录成长中心**连登天数**（WorkBuddy 国内版；只读回读的结果）。
+    ///
+    /// 存下来是为了让签到中心 / 账号页不用每次打开都打一发上游
+    /// （`GET /activity/growth/streak` 是只读查询，但几十个账号就是一串请求）。
+    /// 与 [`Self::mark_checkin`] 同一口径：账号级事实、低频写、失败不致命
+    /// （返回 bool，调用方最多记一条日志）。
+    ///
+    /// **不**动 `updatedAt`：连登是上游状态的回读，不是用户改配置。
+    /// 值没变时不写库 —— 签到链每次都会回读，同一天内多次签到不该反复落盘。
+    pub fn mark_streak_days(&self, id: &str, days: i64) -> bool {
+        let _guard = self.guard();
+        let Some(mut record) = self.record_by_id(&_guard, id) else {
+            return false;
+        };
+        let existing = record
+            .fields()
+            .get("streakDays")
+            .and_then(Value::as_i64);
+        if existing == Some(days) {
+            return true;
+        }
+        record
+            .fields_mut()
+            .insert("streakDays".to_string(), Value::from(days));
         self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))
             .is_ok()
     }
@@ -421,7 +619,10 @@ impl AccountStore {
     ///      顺序（provider 路由优先级 → 组内优先级 → 加入时间）排好，再连续编号，
     ///      于是升级前后实际先用哪个账号完全一致，用户不会感到突变；
     ///   ③ 全局去重（手工编辑出的并列号）；
-    ///   ④ Cline 拆池改名（`provider: "cline"` + `pool` 字段 → 两家里的某一家）。
+    ///   ④ Cline 拆池改名（`provider: "cline"` + `pool` 字段 → 两家里的某一家）；
+    ///   ⑤⑥ WorkBuddy / Qoder 国际版拆家（只改 provider）；
+    ///   ⑦ OfficeAce 账号名自愈（从记录里躺着的 refreshToken 解显示名）；
+    ///   ⑧ 智谱清言令牌从嵌套 `auth` 抬到顶层。
     ///
     /// 顺序上 ④ 必须在 ①②③ **之后**：前几步按 provider 分组时看到的还是旧 id
     /// （一条 `cline` 组），改名后这一组被拆成两条；若反过来先改名，优先级整队
@@ -477,21 +678,32 @@ impl AccountStore {
         // 排在 Cline 之后只是让「拆家类迁移」聚在一起。
         let workbuddy_moved = Self::migrate_workbuddy_intl_accounts(&mut state);
 
-        // ⑥ Qoder 国际版拆家（见 `migrate_qoder_intl_accounts`）：与 ⑤ 同款，
-        // 只改 `provider`、不改 id（Qoder 的 id 本来就带地区段）。
-        let qoder_moved = Self::migrate_qoder_intl_accounts(&mut state);
+        // ⑥ Qoder 地区归位：兼容旧记录，并恢复有明确国内版证据的错分账号。
+        // 只改 provider，不改作为请求历史引用键的账号 id。
+        let qoder_moved = super::qoder_accounts::migrate_accounts(&mut state.accounts);
 
-        // ⑦ OfficeAce 账号名自愈（见 `officeace_accounts::heal_names_from_stored_tokens`）：
-        // 存量记录的 name 曾是十六进制的 account_id/principal_id，而显示名一直躺在**同一行**
-        // 的 refreshToken 里 —— 这里零网络地把它解出来补上，不等续期、不碰那枚一次性令牌。
-        let officeace_named =
-            super::officeace_accounts::heal_names_from_stored_tokens(&mut state.accounts);
-        if officeace_named > 0 {
+        // ⑦ OfficeAce 账号名自愈（存量记录的 name 曾是十六进制 id，显示名躺在
+        // refreshToken 的 claims 里）已随实现搬到插件：插件在登录时就把名字取全，
+        // 而网关不再解析这家令牌的 claims。存量记录的名字原样保留 —— 它们是
+        // 用户看得见的历史，不该因为一次升级被改写。
+
+        // ⑧ 智谱清言令牌从嵌套 `auth` 抬到顶层
+        // （见 `chatglm_accounts::migrate_nested_tokens`）：首版把令牌写进了嵌套
+        // `auth`，而 `has_credentials()` 只读顶层 —— 不抬的话那几条存量记录会一直
+        // 被静默过滤掉（模型管理里看不到这一家、余额报「没有可用凭证」）。
+        let chatglm_healed =
+            super::chatglm_accounts::migrate_nested_tokens(&mut state.accounts);
+        if chatglm_healed > 0 {
             logging::log(
                 "[Accounts]",
-                &format!("🏷️  已按登录态为 {officeace_named} 个 OfficeAce 账号补回上游显示名"),
+                &format!(
+                    "🔧 已修复 {chatglm_healed} 个智谱清言账号的令牌存储位置（嵌套 auth → 顶层，\
+                     修复后即可正常选路与查询余额）"
+                ),
             );
         }
+
+        let codearts_limiters = super::codearts_accounts::migrate_limiters(&mut state.accounts);
 
         if provider_added == 0
             && assignments.is_empty()
@@ -499,7 +711,8 @@ impl AccountStore {
             && cline_renamed == 0
             && workbuddy_moved == 0
             && qoder_moved == 0
-            && officeace_named == 0
+            && chatglm_healed == 0
+            && codearts_limiters == 0
         {
             return json!({
                 "providerAdded": 0,
@@ -519,6 +732,9 @@ impl AccountStore {
                 "priorityChanged": false,
                 "assignments": [],
             });
+        }
+        if codearts_limiters > 0 {
+            logging::log("[Accounts]", &format!("已移除 {codearts_limiters} 个 CodeArts 账号的过期活动 Token 限制；无其他规则时改用总积分保护"));
         }
         if cline_renamed > 0 {
             logging::log(
@@ -541,7 +757,7 @@ impl AccountStore {
             logging::log(
                 "[Accounts]",
                 &format!(
-                    "🔀 Qoder 已拆为中国版 / 国际版两家，{qoder_moved} 个国际版账号已归位\
+                    "🔀 Qoder 已按地区归位 {qoder_moved} 个账号\
                      （凭证、优先级、限流记录与账号 id 均未改动）"
                 ),
             );
@@ -614,6 +830,64 @@ impl AccountStore {
                     "[Accounts]",
                     &format!(
                         "⚠️  历史账号凭证加密未完成（下次启动会自动重试，本次账号照常可用）: {error}"
+                    ),
+                );
+            }
+        }
+    }
+
+    /// 把「插件落库但顶层缺身份字段」的账号补齐（幂等，可重复调用）。
+    ///
+    /// ── 它补的是什么（issue #380）──────────────────────────────
+    /// 插件登录 / 插件落库写的是 `pluginSecret` + `pluginPublic`，顶层没有
+    /// `uid` / `edition` / `endpoint` 等字段。而网关的计费、签到、余额几条
+    /// 读路径只认顶层 —— 那批账号「对话正常、签到全报找不到账号记录」。
+    ///
+    /// 写侧（`plugin_identity::mirror_identity`）已经在新写入时镜像了，本函数
+    /// 只收尾**升级前已经在库里**的那批。读侧也做了回落（`StoredAccount::uid`
+    /// 等），所以即使这一步没跑成，功能也是好的 —— 它只是把字段真正落到盘上，
+    /// 让导出的 JSON 与其它按顶层字段工作的地方也一致。
+    ///
+    /// ── 幂等与失败语义 ──────────────────────────────────────────
+    /// 判据是数据自证：只有「顶层缺、子对象里有」时才写，没有 kv 标记。
+    /// 一次读一次写（`migrate_startup` 同款）；没有要补的记录时不写库。
+    pub fn backfill_plugin_identity(&self) {
+        let guard = self.guard();
+        let mut state = self.load_locked(&guard);
+        let mut changed = 0usize;
+        for record in state.accounts.iter_mut() {
+            // 只处理插件落库形态（有 pluginSecret 或 pluginPublic）：内置记录
+            // 的顶层字段本来就是权威，不该被子对象覆盖。
+            let has_plugin_side = record.get("pluginSecret").is_some_and(|value| !value.is_null())
+                || record.get("pluginPublic").is_some_and(|value| !value.is_null());
+            if !has_plugin_side {
+                continue;
+            }
+            let before = record.to_value();
+            let provider = record.provider();
+            super::plugin_identity::mirror_identity(record, &provider);
+            if record.to_value() != before {
+                changed += 1;
+            }
+        }
+        if changed == 0 {
+            return;
+        }
+        match self.save_locked(&state, &guard) {
+            Ok(()) => {
+                drop(guard);
+                logging::log(
+                    "[Accounts]",
+                    &format!("🔧 已为 {changed} 个插件账号补齐顶层身份字段（uid / edition 等）"),
+                );
+            }
+            Err(error) => {
+                drop(guard);
+                logging::log(
+                    "[Accounts]",
+                    &format!(
+                        "⚠️  插件账号身份字段回填未完成（下次启动会自动重试，本次账号照常可用）: {}",
+                        error.message
                     ),
                 );
             }
@@ -704,7 +978,7 @@ impl AccountStore {
         const LEGACY_WORKBUDDY_ID: &str = "workbuddy";
         let mut moved = 0usize;
         for record in state.accounts.iter_mut() {
-            if record.provider() != LEGACY_WORKBUDDY_ID {
+            if record.provider() != LEGACY_WORKBUDDY_ID || record.has_plugin_secret() {
                 continue;
             }
             let region = crate::server::core::providers::workbuddy::Region::from_edition_id(
@@ -715,46 +989,6 @@ impl AccountStore {
                 continue;
             }
             record.set_provider(provider);
-            moved += 1;
-        }
-        moved
-    }
-
-    /// Qoder 国际版拆家：把 `provider == "qoder"` 且地区为国际版的记录归到
-    /// `qoder-intl`（2026-10，见 `providers::qoder::endpoints` 的模块头）。
-    ///
-    /// ── 判据：记录里的地区，而不是 id 前缀 ─────────────────────
-    /// 拆家前「这个账号属于哪个地区」由记录的 `mode`（兜底 `edition`）字段
-    /// 表达（`Region::from_payload` 的读取口径）。id 虽然也带地区段
-    /// （`qoder-global-…` / `qoder-cn-…`），但那是生成时的快照，记录的权威
-    /// 表达一直是凭证字段 —— 与 WorkBuddy 拆家「判据是 edition」同一取舍。
-    ///
-    /// ── 为什么不改 id（与 `migrate_cline_accounts` 的差别）────────
-    /// Qoder 的 id 生成时已含地区段，两地区的 id 空间天然不相交（同 WorkBuddy
-    /// 拆家的论证）；而 id 是 `requests.account_id` 与请求报表的引用键，改名
-    /// 会让历史记录对不上账号。
-    ///
-    /// ── 幂等 ────────────────────────────────────────────────────
-    /// 判据是数据本身（`provider == qoder && 地区 == 国际`）：迁完就没有
-    /// 这样的记录，再跑一遍返回 0、不写库。
-    fn migrate_qoder_intl_accounts(state: &mut AccountState) -> usize {
-        /// 拆家前的唯一 Qoder provider id（只出现在这里）
-        const LEGACY_QODER_ID: &str = "qoder";
-        let mut moved = 0usize;
-        for record in state.accounts.iter_mut() {
-            if record.provider() != LEGACY_QODER_ID {
-                continue;
-            }
-            let Some(region) =
-                crate::server::core::providers::qoder::endpoints::Region::from_payload(
-                    &record.to_value(),
-                )
-                .ok()
-                .filter(|region| *region == crate::server::core::providers::qoder::endpoints::Region::Global)
-            else {
-                continue;
-            };
-            record.set_provider(region.provider_id());
             moved += 1;
         }
         moved
@@ -889,5 +1123,49 @@ impl AccountStore {
                 None
             }
         }
+    }
+}
+
+/// 递归改写 `limiterGroups` / `limiters` 里所有 `models` 数组，并去重。
+fn rewrite_models_arrays(value: &mut Value, mapping: &HashMap<String, String>) -> bool {
+    match value {
+        Value::Object(object) => {
+            let mut changed = false;
+            for (key, child) in object.iter_mut() {
+                if key == "models" {
+                    if let Some(items) = child.as_array_mut() {
+                        for item in items.iter_mut() {
+                            if let Some(text) = item.as_str() {
+                                if let Some(base) =
+                                    mapping.get(&text.trim().to_ascii_lowercase())
+                                {
+                                    *item = Value::String(base.clone());
+                                    changed = true;
+                                }
+                            }
+                        }
+                        let before = items.len();
+                        let mut seen = HashSet::new();
+                        items.retain(|item| {
+                            item.as_str()
+                                .map(|text| seen.insert(text.to_ascii_lowercase()))
+                                .unwrap_or(true)
+                        });
+                        changed |= items.len() != before;
+                    }
+                } else if rewrite_models_arrays(child, mapping) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= rewrite_models_arrays(item, mapping);
+            }
+            changed
+        }
+        _ => false,
     }
 }

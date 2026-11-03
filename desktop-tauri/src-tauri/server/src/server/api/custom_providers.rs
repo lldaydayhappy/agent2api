@@ -300,7 +300,7 @@ pub async fn set_custom_models(State(_state): State<ServerState>, body: Bytes) -
         object.get("mappings").cloned().unwrap_or(Value::Null),
     ) {
         Ok(updated) => updated,
-        Err(message) => return errors::management_error(400, message),
+        Err(error) => return errors::management_error(error.status_code, error.message),
     };
     let model_count = updated
         .get("models")
@@ -328,7 +328,7 @@ pub async fn set_custom_models(State(_state): State<ServerState>, body: Bytes) -
 ///
 /// body：`{providerId}`。响应 `{models: ["id", ...]}` —— **不落盘**，
 /// 由前端并进编辑副本让用户确认后再调 /models 保存（两步式的理由见模块头）。
-/// 会**真打上游**（一次 GET），所以挂 protected 且失败文案里带上游原文摘要。
+/// 会**真打上游**（一次 GET），所以挂 protected 且失败文案里带上游原始响应正文。
 pub async fn fetch_custom_models(State(state): State<ServerState>, body: Bytes) -> Response {
     let object = match body_object(&body) {
         Ok(object) => object,
