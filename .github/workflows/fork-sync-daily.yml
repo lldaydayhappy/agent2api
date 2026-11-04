@@ -16,7 +16,6 @@ on:
 permissions:
   contents: write
   issues: write
-  workflows: write   # 必需：上游改动 .github/workflows/* 时，GITHUB_TOKEN 没这个权限会 422
   actions: write     # 必需：self-heal 要禁用上游新带来的 workflow
 
 concurrency:
