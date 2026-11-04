@@ -2,8 +2,8 @@ name: Fork Sync (daily)
 
 on:
   schedule:
-    # 每 2 小时试一次，一天 12 次机会。幂等：behind=0 时 4 秒空转退出。
-    # GitHub 的 cron 延迟/丢单是常态（实测延迟可达 3 小时），高频重试是唯一
+    # 每 2 小时试一次，一天 12 次机会。幂等：behind=0 时几秒空转退出。
+    # GitHub 的 cron 延迟/丢单是常态（实测延迟可达数小时），高频重试是唯一
     # 不依赖外部服务就能把「每天至少成功一次」压到接近确定的办法。
     - cron: '17 */2 * * *'
   workflow_dispatch:
@@ -16,6 +16,8 @@ on:
 permissions:
   contents: write
   issues: write
+  workflows: write   # 必需：上游改动 .github/workflows/* 时，GITHUB_TOKEN 没这个权限会 422
+  actions: write     # 必需：self-heal 要禁用上游新带来的 workflow
 
 concurrency:
   group: fork-sync
@@ -36,8 +38,9 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           python3 - <<'PY'
-          import json, os, sys, time, socket, urllib.request, urllib.error
+          import json, os, sys, time, urllib.request, urllib.error
 
+          SELF  = "fork-sync-daily.yml"
           tok   = os.environ["GH_TOKEN"]
           fb    = os.environ.get("FALLBACK_TOKEN") or ""
           repo  = os.environ["REPO"]
@@ -65,7 +68,7 @@ jobs:
                       return e.code, {"message": raw.decode(errors="replace")[:400]}
 
           def call(method, path, body=None):
-              """带三层韧性：网络/5xx 重试 -> 401 换 github.token -> 回落最后结果。"""
+              """网络/5xx/限流 重试 -> 401 换 github.token -> 回落最后结果。"""
               global tok
               last = (0, {"message": "no attempt made"})
               for attempt in range(4):
@@ -87,83 +90,109 @@ jobs:
                   return st, data
               return last
 
-          print(f"auth      : {'github.token' if tok == fb else 'repo secret'}")
+          def self_heal():
+              """上游新带来的 workflow 一律禁用：它们在 fork 上缺 secret/runner，
+              跑起来只会失败并发邮件。禁用而非删除，避免 modify/delete 冲突。"""
+              st, wfs = call("GET", f"/repos/{repo}/actions/workflows?per_page=100")
+              if st != 200:
+                  print(f"self-heal: cannot list workflows (HTTP {st})")
+                  return
+              n = 0
+              for w in wfs.get("workflows", []):
+                  fn = w["path"].split("/")[-1]
+                  if fn == SELF or w.get("state") != "active":
+                      continue
+                  s2, _ = call("PUT", f"/repos/{repo}/actions/workflows/{w['id']}/disable", {})
+                  print(f"self-heal: disabled {fn} (HTTP {s2})")
+                  n += 1
+              print(f"self-heal: {n} upstream workflow(s) disabled")
 
-          st, info = call("GET", f"/repos/{repo}")
-          if st != 200:
-              sys.exit(f"cannot read repo info: {st} {info}")
-          if not info.get("fork"):
-              print("not a fork, nothing to sync")
-              sys.exit(0)
+          code = 0
+          try:
+              print(f"auth      : {'github.token' if tok == fb else 'repo secret'}")
 
-          parent = (info.get("parent") or {}).get("full_name")
-          pbr    = (info.get("parent") or {}).get("default_branch")
-          if not parent:
-              print("fork has no upstream parent (detached), nothing to sync")
-              sys.exit(0)
-          owner  = info["owner"]["login"]
+              st, info = call("GET", f"/repos/{repo}")
+              if st != 200:
+                  print(f"::warning::cannot read repo info (HTTP {st}) — transient, next run retries")
+                  sys.exit(0)
+              if not info.get("fork"):
+                  print("not a fork, nothing to sync")
+                  sys.exit(0)
 
-          st, cmp = call("GET", f"/repos/{parent}/compare/{pbr}...{owner}:{br}")
-          if st != 200:
-              print(f"compare unavailable ({st}), trying merge anyway")
-              behind = ahead = None
-          else:
-              behind, ahead = cmp.get("behind_by", 0), cmp.get("ahead_by", 0)
+              parent = (info.get("parent") or {}).get("full_name")
+              pbr    = (info.get("parent") or {}).get("default_branch")
+              if not parent:
+                  print("::warning::fork has no upstream parent (detached) — nothing to sync")
+                  sys.exit(0)
+              owner = info["owner"]["login"]
 
-          print(f"repo      : {repo}")
-          print(f"branch    : {br}")
-          print(f"upstream  : {parent}:{pbr}")
-          if behind is not None:
-              print(f"divergence: behind {behind}, ahead {ahead}")
-
-          if behind == 0:
-              print("already up to date")
-              sys.exit(0)
-          if dry:
-              print("dry run: skipping merge")
-              sys.exit(0)
-
-          st, res = call("POST", f"/repos/{repo}/merge-upstream", {"branch": br})
-          print(f"merge-upstream -> HTTP {st}")
-          if st == 200:
-              print(json.dumps({"merge_type": res.get("merge_type"), "base_branch": res.get("base_branch")}))
-              sys.exit(0)
-
-          msg = res.get("message", "")
-          print(f"message: {msg}")
-
-          summary = os.environ.get("GITHUB_STEP_SUMMARY")
-          def note(text):
-              print(text)
-              if summary:
-                  with open(summary, "a") as fh:
-                      fh.write(text + "\n")
-
-          if st == 409:
-              title = f"fork-sync: manual conflict on `{br}`"
-              body = (
-                  f"Daily upstream sync failed with a merge conflict.\n\n"
-                  f"- upstream: `{parent}:{pbr}`\n"
-                  f"- branch: `{br}`\n"
-                  f"- behind {behind}, ahead {ahead}\n\n"
-                  f"Resolve locally:\n\n```\ngit remote add upstream https://github.com/{parent}.git\n"
-                  f"git fetch upstream && git merge upstream/{pbr}\n"
-                  f"# fix conflicts, commit, push\n```"
-              )
-              note(f"## fork-sync conflict on `{br}`\n\nupstream `{parent}:{pbr}` — behind {behind}, ahead {ahead}\n\n"
-                   f"```\ngit fetch upstream && git merge upstream/{pbr}\n# fix conflicts, commit, push\n```")
-              st2, issues = call("GET", f"/repos/{repo}/issues?state=open&per_page=100")
-              if st2 == 200:
-                  existing = [i for i in (issues if isinstance(issues, list) else []) if i.get("title") == title]
-                  if existing:
-                      note(f"conflict issue already open: {existing[0]['html_url']}")
-                  else:
-                      st3, res3 = call("POST", f"/repos/{repo}/issues", {"title": title, "body": body})
-                      note(f"opened conflict issue: HTTP {st3} {res3.get('html_url', '')}")
+              st, cmp = call("GET", f"/repos/{parent}/compare/{pbr}...{owner}:{br}")
+              if st == 404:
+                  print(f"::error::upstream {parent}:{pbr} not reachable (deleted/private/renamed)")
+                  sys.exit(1)
+              if st != 200:
+                  print(f"compare unavailable ({st}), trying merge anyway")
+                  behind = ahead = None
               else:
-                  note("issues disabled on this repo (HTTP %s) — reporting in job summary only" % st2)
-              sys.exit(1)
+                  behind, ahead = cmp.get("behind_by", 0), cmp.get("ahead_by", 0)
 
-          note(f"merge-upstream failed: {st} {msg}")
-          sys.exit(1)
+              print(f"repo      : {repo}")
+              print(f"branch    : {br}")
+              print(f"upstream  : {parent}:{pbr}")
+              if behind is not None:
+                  print(f"divergence: behind {behind}, ahead {ahead}")
+
+              if behind == 0:
+                  print("already up to date")
+                  sys.exit(0)
+              if dry:
+                  print("dry run: skipping merge")
+                  sys.exit(0)
+
+              st, res = call("POST", f"/repos/{repo}/merge-upstream", {"branch": br})
+              print(f"merge-upstream -> HTTP {st}")
+              if st == 200:
+                  print(json.dumps({"merge_type": res.get("merge_type"),
+                                    "base_branch": res.get("base_branch")}))
+                  sys.exit(0)
+
+              msg = res.get("message", "")
+              print(f"message: {msg}")
+
+              if st == 409:
+                  title = f"fork-sync: manual conflict on `{br}`"
+                  body = (f"Daily upstream sync hit a merge conflict.\n\n"
+                          f"- upstream: `{parent}:{pbr}`\n- branch: `{br}`\n"
+                          f"- behind {behind}, ahead {ahead}\n\n"
+                          f"```\ngit remote add upstream https://github.com/{parent}.git\n"
+                          f"git fetch upstream && git merge upstream/{pbr}\n"
+                          f"# fix conflicts, commit, push\n```")
+                  print(f"::error::merge conflict on {br} — manual resolution required")
+                  st2, issues = call("GET", f"/repos/{repo}/issues?state=open&per_page=100")
+                  if st2 == 200:
+                      ex = [i for i in (issues if isinstance(issues, list) else [])
+                            if i.get("title") == title]
+                      if ex:
+                          print(f"conflict issue already open: {ex[0]['html_url']}")
+                      else:
+                          s3, r3 = call("POST", f"/repos/{repo}/issues",
+                                        {"title": title, "body": body})
+                          print(f"opened conflict issue: HTTP {s3} {r3.get('html_url','')}")
+                  sys.exit(1)
+
+              if st == 0 or st == 429 or 500 <= st < 600:
+                  print(f"::warning::transient merge failure (HTTP {st or 'transport'}) — next run retries")
+                  sys.exit(0)
+
+              print(f"::error::merge-upstream failed: {st} {msg}")
+              sys.exit(1)
+          except SystemExit as e:
+              code = e.code if isinstance(e.code, int) else 1
+          finally:
+              try:
+                  self_heal()
+              except Exception as e:
+                  print(f"self-heal error: {e}")
+
+          sys.exit(code)
           PY
