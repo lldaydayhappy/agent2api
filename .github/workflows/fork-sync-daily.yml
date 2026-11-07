@@ -196,16 +196,17 @@ jobs:
               if behind is not None:
                   print(f"divergence: behind {behind}, ahead {ahead}")
 
+              hold = paused(repo)
+              if hold:
+                  print(f"::notice::sync paused (FORK_SYNC_PAUSE={hold}) — 本轮不合并")
+
               if behind == 0:
                   print("already up to date")
                   sys.exit(0)
               if dry:
                   print("dry run: skipping merge")
                   sys.exit(0)
-
-              hold = paused(repo)
               if hold:
-                  print(f"::notice::sync paused (FORK_SYNC_PAUSE={hold}) — skipping merge")
                   sys.exit(0)
 
               snapshot(repo, br)
