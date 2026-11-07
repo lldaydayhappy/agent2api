@@ -111,6 +111,37 @@ jobs:
                       ok += 1
               print(f"tags: +{ok}/{len(new)} new tag refs (fork now {len(f) + ok})")
 
+          def snapshot(repo, br, keep=120):
+              """合并前给当前状态打日期快照 —— 上游推了坏更新时可以退回来。
+              每天最多一个（同名存在即跳过），只保留最近 keep 个。"""
+              name = "snapshot-" + time.strftime("%Y%m%d", time.gmtime())
+              st, _ = call("GET", f"/repos/{repo}/git/ref/tags/{name}")
+              if st == 200:
+                  print(f"snapshot: {name} already exists")
+              else:
+                  s2, head = call("GET", f"/repos/{repo}/git/ref/heads/{br}")
+                  sha = ((head or {}).get("object") or {}).get("sha")
+                  if not sha:
+                      print("snapshot: cannot read head, skipped")
+                  else:
+                      r, _ = call("POST", f"/repos/{repo}/git/refs",
+                                  {"ref": f"refs/tags/{name}", "sha": sha})
+                      print(f"snapshot: {name} -> {sha[:8]} (HTTP {r})")
+              # 清理过老的快照，避免无限堆积
+              st3, tags = call("GET", f"/repos/{repo}/git/matching-refs/tags/snapshot-")
+              if st3 == 200 and isinstance(tags, list):
+                  names = sorted(t["ref"].split("/")[-1] for t in tags)
+                  for old in names[:-keep]:
+                      call("DELETE", f"/repos/{repo}/git/refs/tags/{old}")
+                      print(f"snapshot: pruned {old}")
+
+          def paused(repo):
+              """仓库变量 FORK_SYNC_PAUSE 非空即暂停同步 —— 刹车开关。"""
+              st, v = call("GET", f"/repos/{repo}/actions/variables/FORK_SYNC_PAUSE")
+              if st == 200 and str(v.get("value", "")).strip().lower() not in ("", "0", "false", "no"):
+                  return v.get("value")
+              return None
+
           def self_heal():
               """上游新带来的 workflow 一律禁用：它们在 fork 上缺 secret/runner，
               跑起来只会失败并发邮件。禁用而非删除，避免 modify/delete 冲突。"""
@@ -171,6 +202,13 @@ jobs:
               if dry:
                   print("dry run: skipping merge")
                   sys.exit(0)
+
+              hold = paused(repo)
+              if hold:
+                  print(f"::notice::sync paused (FORK_SYNC_PAUSE={hold}) — skipping merge")
+                  sys.exit(0)
+
+              snapshot(repo, br)
 
               st, res = call("POST", f"/repos/{repo}/merge-upstream", {"branch": br})
               print(f"merge-upstream -> HTTP {st}")
