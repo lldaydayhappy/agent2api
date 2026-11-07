@@ -89,6 +89,28 @@ jobs:
                   return st, data
               return last
 
+          def sync_tags(parent, repo):
+              """补上游 tag 引用。GitHub fork 不复制 refs/tags/*，这里按需补。
+              用 API 而非 git：tag 指向的提交都已存在于 fork，只需建引用，无需传对象。
+              增量比较第一页即可——上游新增的 tag 必然出现在最新一页。"""
+              st, u = call("GET", f"/repos/{parent}/tags?per_page=100")
+              s2, f = call("GET", f"/repos/{repo}/tags?per_page=100")
+              if st != 200 or s2 != 200 or not isinstance(u, list) or not isinstance(f, list):
+                  print("tags: compare failed, skipped")
+                  return
+              have = {t["name"] for t in f}
+              new = [t for t in u if t["name"] not in have]
+              if not new:
+                  print(f"tags: up to date ({len(f)} refs in fork)")
+                  return
+              ok = 0
+              for t in new:
+                  r, _ = call("POST", f"/repos/{repo}/git/refs",
+                              {"ref": "refs/tags/" + t["name"], "sha": t["commit"]["sha"]})
+                  if r in (200, 201):
+                      ok += 1
+              print(f"tags: +{ok}/{len(new)} new tag refs (fork now {len(f) + ok})")
+
           def self_heal():
               """上游新带来的 workflow 一律禁用：它们在 fork 上缺 secret/runner，
               跑起来只会失败并发邮件。禁用而非删除，避免 modify/delete 冲突。"""
@@ -107,6 +129,7 @@ jobs:
               print(f"self-heal: {n} upstream workflow(s) disabled")
 
           code = 0
+          ctx = {"parent": None}
           try:
               print(f"auth      : {'github.token' if tok == fb else 'repo secret'}")
 
@@ -123,6 +146,7 @@ jobs:
               if not parent:
                   print("::warning::fork has no upstream parent (detached) — nothing to sync")
                   sys.exit(0)
+              ctx["parent"] = parent
               owner = info["owner"]["login"]
 
               st, cmp = call("GET", f"/repos/{parent}/compare/{pbr}...{owner}:{br}")
@@ -188,6 +212,11 @@ jobs:
           except SystemExit as e:
               code = e.code if isinstance(e.code, int) else 1
           finally:
+              if ctx["parent"]:
+                  try:
+                      sync_tags(ctx["parent"], repo)
+                  except Exception as e:
+                      print(f"tag sync error: {e}")
               try:
                   self_heal()
               except Exception as e:
