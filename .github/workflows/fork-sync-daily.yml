@@ -200,6 +200,10 @@ jobs:
               if hold:
                   print(f"::notice::sync paused (FORK_SYNC_PAUSE={hold}) — 本轮不合并")
 
+              # 合并前先把残留的 active workflow 按掉：merge 会产生 push 事件，
+              # 若此时还有上游 CI 处于 active，它们会被这次 push 拉起来（在 fork 上多半跑挂）。
+              self_heal()
+
               if behind == 0:
                   print("already up to date")
                   sys.exit(0)
