@@ -12,6 +12,10 @@ on:
         description: 'Only report divergence, do not merge'
         type: boolean
         default: false
+      via_fanout:
+        description: 'internal: triggered by a peer repo, do not fan out further'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -35,6 +39,7 @@ jobs:
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.event.repository.default_branch }}
           DRY_RUN: ${{ inputs.dry_run }}
+          VIA_FANOUT: ${{ inputs.via_fanout }}
         run: |
           python3 - <<'PY'
           import json, os, sys, time, urllib.request, urllib.error
@@ -141,6 +146,36 @@ jobs:
               if st == 200 and str(v.get("value", "")).strip().lower() not in ("", "0", "false", "no"):
                   return v.get("value")
               return None
+
+          # 少数仓库当"枢纽"：它们的定时任务跑完，顺手拉起其余仓库。
+          # 因为 GitHub 会把单个仓库的 schedule 节流甚至停摆（agent2api 已出现两次），
+          # 只要还有任一枢纽活着，全网就还在同步。重复触发是幂等的，无害。
+          HUBS = {"lldaydayhappy/rea", "lldaydayhappy/workbuddy-manager"}
+          PEERS = ["lldaydayhappy/AIHOT", "lldaydayhappy/agent-autoloop",
+                   "lldaydayhappy/agent2api", "lldaydayhappy/de-armor",
+                   "lldaydayhappy/dsh-purge", "lldaydayhappy/jailbreaks",
+                   "lldaydayhappy/rea", "lldaydayhappy/workbuddy-manager",
+                   "lldaydayhappy/workbuddy2api-hub"]
+          PEER_BRANCH = {"lldaydayhappy/dsh-purge": "master"}
+
+          def fanout(repo):
+              if repo not in HUBS:
+                  return
+              if (os.environ.get("VIA_FANOUT") or "").lower() in ("1", "true"):
+                  print("fanout: skipped (this run was pulled by a peer)")
+                  return
+              ok = fail = 0
+              for peer in PEERS:
+                  if peer == repo:
+                      continue
+                  r, _ = call("POST", f"/repos/{peer}/actions/workflows/{SELF}/dispatches",
+                              {"ref": PEER_BRANCH.get(peer, "main"), "inputs": {"via_fanout": "true"}})
+                  if r in (200, 201, 204):
+                      ok += 1
+                  else:
+                      fail += 1
+                      print(f"fanout: {peer.split('/')[-1]} failed (HTTP {r})")
+              print(f"fanout: pulled {ok} peer(s), {fail} failed")
 
           def self_heal():
               """上游新带来的 workflow 一律禁用：它们在 fork 上缺 secret/runner，
@@ -264,6 +299,10 @@ jobs:
                   self_heal()
               except Exception as e:
                   print(f"self-heal error: {e}")
+              try:
+                  fanout(repo)
+              except Exception as e:
+                  print(f"fanout error: {e}")
 
           sys.exit(code)
           PY
