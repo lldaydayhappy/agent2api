@@ -217,8 +217,11 @@ jobs:
 
               st, cmp = call("GET", f"/repos/{parent}/compare/{pbr}...{owner}:{br}")
               if st == 404:
-                  print(f"::error::upstream {parent}:{pbr} not reachable (deleted/private/renamed)")
-                  sys.exit(1)
+                  # 上游被删/转私有/改名：不动 fork（保持原样），也不发失败通知。
+                  # 上游若恢复，下一轮会自动接着同步。用户可用 `manage.py status` 查看上游可达性。
+                  print(f"::warning::upstream {parent}:{pbr} unreachable (deleted/private/renamed)"
+                        " — fork left untouched")
+                  sys.exit(0)
               if st != 200:
                   print(f"compare unavailable ({st}), trying merge anyway")
                   behind = ahead = None
