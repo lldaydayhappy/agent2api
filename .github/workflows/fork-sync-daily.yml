@@ -154,8 +154,8 @@ jobs:
           PEERS = ["lldaydayhappy/AIHOT", "lldaydayhappy/agent-autoloop",
                    "lldaydayhappy/agent2api", "lldaydayhappy/de-armor",
                    "lldaydayhappy/dsh-purge", "lldaydayhappy/jailbreaks",
-                   "lldaydayhappy/rea", "lldaydayhappy/workbuddy-manager",
-                   "lldaydayhappy/workbuddy2api-hub"]
+                   "lldaydayhappy/rea", "lldaydayhappy/study-materials-fork",
+                   "lldaydayhappy/workbuddy-manager", "lldaydayhappy/workbuddy2api-hub"]
           PEER_BRANCH = {"lldaydayhappy/dsh-purge": "master"}
 
           def fanout(repo):
