@@ -6,13 +6,19 @@ export { dayKey, defaultCustomRange, DAY_KEY_RE } from '../../../ui-shared/date-
 
 /* ─── 数据形状（后端 /api/stats/summary，字段都可缺省） ─── */
 
-export type StatsSlice = { id?: string; model?: string; label?: string; tokens?: number; requests?: number }
-export type StatsDay = {
-  date?: string; tokens?: number; requests?: number
+export type StatsUsage = {
+  requests?: number; success?: number | null; failures?: number | null; totalTokens?: number
+  successRate?: number | null; promptTokens?: number | null; completionTokens?: number | null
+  cacheReadTokens?: number | null; cacheRate?: number | null; tokenDetailsComplete?: boolean
+  costUsd?: number; unpricedRequests?: number
+}
+export type StatsSlice = StatsUsage & { id?: string; model?: string; label?: string; tokens?: number }
+export type StatsDay = StatsUsage & {
+  date?: string; tokens?: number
   models?: StatsSlice[]; clients?: StatsSlice[]; apiKeys?: StatsSlice[]
 }
-export type StatsHour = {
-  hour?: string; rate?: number; totalTokens?: number; hitTokens?: number; inputTokens?: number
+export type StatsHour = StatsUsage & {
+  hour?: string; rate?: number; hitTokens?: number; inputTokens?: number
   models?: StatsSlice[]
 }
 /** 排行 / 环形图共用的一条：模型维度用 model 当身份，提供商与账号维度用 id */
@@ -22,22 +28,25 @@ export type StatsGroup = {
   successRate?: number | null; promptTokens?: number | null; completionTokens?: number | null
   cacheReadTokens?: number | null; cacheRate?: number | null; lastUsedAt?: number | null
   tokenDetailsComplete?: boolean
+  costUsd?: number; unpricedRequests?: number
   source?: string; filterValue?: string; state?: 'enabled' | 'disabled' | 'deleted'
 }
-export type StatsOverview = {
-  requests?: number; successful?: number; tokens?: number; activeDays?: number; streak?: number
+export type StatsOverview = StatsUsage & {
+  successful?: number; tokens?: number; activeDays?: number; streak?: number
   topModel?: { model?: string; tokens?: number; percentage?: number } | null
 }
 export type CacheRateWindow = { inputTokens?: number; hitTokens?: number; rate?: number }
 export type StatsSummary = {
   range?: string; startDate?: string; endDate?: string
+  currency?: 'usd' | 'cny'; exchangeRate?: number
+  fx?: { rate: number; updatedAt: number; stale: boolean; fallback: boolean }
   overview?: StatsOverview
   providers?: StatsGroup[]
   accounts?: StatsGroup[]
   models?: StatsGroup[]
   clients?: StatsGroup[]
   apiKeys?: StatsGroup[]
-  apiKeyDetail?: { filterValue?: string; label?: string; requests?: number; totalTokens?: number; detailsComplete?: boolean; clients?: StatsGroup[]; models?: StatsGroup[] } | null
+  apiKeyDetail?: { filterValue?: string; label?: string; requests?: number; totalTokens?: number; costUsd?: number; unpricedRequests?: number; detailsComplete?: boolean; clients?: StatsGroup[]; models?: StatsGroup[] } | null
   heatmap?: StatsDay[]
   cacheRates?: Record<string, CacheRateWindow>
   cacheTrend24h?: StatsHour[]
@@ -195,6 +204,7 @@ export type RankRowView = {
   key: string; id: string; name: string
   full: string; tip: string
   tokensText: string; percentText: string; barWidth: string
+  costUsd: number; unpricedRequests: number
 }
 
 /** null 表示契约没有这一维；空数组表示这个区间没有用量。 */
@@ -206,6 +216,8 @@ export function rankRows(list: StatsGroup[] | undefined): RankRowView[] | null {
       id: String(item?.id ?? '').trim(),
       label: String(item?.label ?? '').trim(),
       tokens: Number(item?.totalTokens ?? item?.tokens) || 0,
+      costUsd: Number(item?.costUsd) || 0,
+      unpricedRequests: Number(item?.unpricedRequests) || 0,
     }))
     .filter(item => item.tokens > 0)
 
@@ -229,6 +241,8 @@ export function rankRows(list: StatsGroup[] | undefined): RankRowView[] | null {
       tokensText: text,
       percentText: `${percent.toFixed(1)}%`,
       barWidth: `${percent.toFixed(1)}%`,
+      costUsd: item.costUsd,
+      unpricedRequests: item.unpricedRequests,
     }
   })
 }
@@ -240,18 +254,23 @@ export function rankTotalText(list: StatsGroup[]): string {
 
 /* ─── 板块三：用量环形图（模型 / 提供商）──── */
 
-export const SLICE_COLORS: readonly string[] = [
-  '#f73b00', '#f7bb07', '#4aaa4d', '#1872cb', '#3444a3', '#13c2c2',
-  '#722ed1', '#eb2f96', '#a0d911', '#34d399', '#d946ef', '#ff85c0',
-  '#b37feb', '#9d174d', '#ffa39e', '#69b1ff',
-]
-export const TIP_DOT_FALLBACK = '#9aa0a6'
+export const SLICE_COLORS: readonly string[] = Array.from({ length: 16 }, (_, index) => `var(--report-slice-${index + 1})`)
+export const TIP_DOT_FALLBACK = 'var(--chart-other)'
+
+export const DONUT_THRESHOLDS = [0.1, 0.5, 1, 2, 3, 5] as const
+export type DonutSettings = { enabled: boolean; threshold: number }
+export const DEFAULT_DONUT_SETTINGS: DonutSettings = { enabled: true, threshold: 1 }
 
 export type DonutDatum = {
   key: string; name: string; fill: string; tip: string
   tokens: number; requests: number; percentage: number
+  members?: DonutDatum[]
 }
-export type DonutView = { size: number; data: DonutDatum[]; totalText: string }
+export type DonutView = { size: number; data: DonutDatum[]; rows: DonutDatum[]; total: number; totalText: string; count: number }
+
+export function formatUsagePercent(rate: number): string {
+  return rate > 0 && rate < 0.001 ? '<0.1%' : formatPercent(rate)
+}
 
 function usageGroups(list: StatsGroup[] | undefined) {
   return (Array.isArray(list) ? list : [])
@@ -274,25 +293,38 @@ export function modelColorMap(list: StatsGroup[] | undefined): Map<string, strin
   return map
 }
 
-export function donutView(list: StatsGroup[] | undefined, unknownLabel: string): DonutView | null {
+export function donutView(list: StatsGroup[] | undefined, unknownLabel: string,
+  settings: DonutSettings = DEFAULT_DONUT_SETTINGS): DonutView | null {
   const rows = usageGroups(list)
   if (!rows.length) return null
   const total = rows.reduce((sum, item) => sum + item.tokens, 0)
   if (!total) return null
   const colors = modelColorMap(list)
+  const tip = (name: string, tokens: number, requests: number) => t('{name} · {tokens} tokens · {n} 次请求 · {pct}', {
+    name, tokens: formatTokens(tokens), n: formatInt(requests), pct: formatUsagePercent(tokens / total),
+  })
   const data = rows.map((item, index): DonutDatum => {
     const name = item.name || unknownLabel
-    const percentage = item.tokens / total
     return {
       key: `${index}-${name}`, name,
       fill: colors.get(name) ?? SLICE_COLORS[index % SLICE_COLORS.length],
-      tokens: item.tokens, requests: item.requests, percentage,
-      tip: t('{name} · {tokens} tokens · {n} 次请求 · {pct}', {
-        name, tokens: formatTokens(item.tokens), n: formatInt(item.requests), pct: formatPercent(percentage),
-      }),
+      tokens: item.tokens, requests: item.requests, percentage: item.tokens / total,
+      tip: tip(name, item.tokens, item.requests),
     }
   })
-  return { size: 220, data, totalText: formatTokens(total) }
+  const threshold = settings.enabled ? settings.threshold / 100 : 0
+  const members = data.filter(item => item.percentage < threshold)
+  const visible = data.filter(item => item.percentage >= threshold)
+  if (members.length) {
+    const tokens = members.reduce((sum, item) => sum + item.tokens, 0)
+    const requests = members.reduce((sum, item) => sum + item.requests, 0)
+    const name = t('其他（{n} 项）', { n: formatInt(members.length) })
+    visible.push({
+      key: 'donut-other', name, fill: 'var(--chart-other)', tokens, requests,
+      percentage: tokens / total, tip: tip(name, tokens, requests), members,
+    })
+  }
+  return { size: 232, data: visible, rows: data, total, totalText: formatTokens(total), count: rows.length }
 }
 
 /* ─── 板块四：热力图 ──────────────────────── */

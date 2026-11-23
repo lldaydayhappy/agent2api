@@ -66,6 +66,10 @@ const EXCLUDED_CONFIG_KEYS: &[&str] = &[
     "kernelDir",
     // 另一把密钥（update-token.key）加密，带过去解不开
     "githubToken",
+    // 登录校验绑定本机域名及独立密钥，不随账号同步切换。
+    crate::server::config::captcha::KEY_PANEL_CAPTCHA,
+    crate::server::core::notifications::KEY_NOTIFICATIONS,
+    crate::server::core::panel_oauth::KEY_PANEL_OAUTH,
     // 代理内核的下载出网线路：绑本机网络环境
     "kernelProxy",
     crate::server::config::KEY_INSTALLED_UPDATE_VERSION,
@@ -118,15 +122,9 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
-    /// 内容哈希：用于「本地内容没变就不上传」与 manifest 的 snapshotId。
-    ///
-    /// 直接哈希**序列化后的字节**：两次构建的字段顺序由 `BTreeMap` 与
-    /// `serde_json` 的结构化序列化保证稳定，不必自己做规范化。
-    pub(crate) fn content_hash(&self) -> String {
-        match serde_json::to_vec(self) {
-            Ok(bytes) => super::sha256_hex(&bytes),
-            Err(_) => String::new(),
-        }
+    /// 业务去重不使用文件字节校验；原始密文和观测时间仍照常导出。
+    pub(crate) fn content_hash(&self, key: Option<&[u8; 32]>) -> Result<String, String> {
+        super::fingerprint::content_hash(self, key)
     }
 
     /// 行数摘要（界面展示「这份快照里有多少数据」）
@@ -142,12 +140,15 @@ impl Snapshot {
 
 /// 构建本机业务快照。
 ///
-/// 单连接锁内完成全部读：账号、用量、签到三张表与 kv 之间没有跨表一致性要求
-/// （它们不是同一个事务里写的），但**同一个快照里**的账号与配置应当尽量来自
-/// 相近的时刻 —— 一次持锁读完全部是最省事也最接近的做法。
+/// 单连接锁和只读事务固定同一份数据库视图，避免其它连接写入时跨表读到不同时刻。
 pub(crate) fn build(db: &Db) -> Result<Snapshot, String> {
     let exported_at = logging::now_ms();
-    db.with(|conn| build_conn(conn, exported_at))
+    db.with_mut(|conn| {
+        let tx = conn.transaction().map_err(|error| format!("开启同步快照事务失败: {error}"))?;
+        let snapshot = build_conn(&tx, exported_at)?;
+        tx.commit().map_err(|error| format!("结束同步快照事务失败: {error}"))?;
+        Ok(snapshot)
+    })
         .ok_or_else(|| "数据库连接不可用，无法生成同步快照".to_string())?
 }
 
@@ -276,7 +277,11 @@ fn base64_encode(bytes: &[u8]) -> String {
 /// ── 只删同步范围内的 kv ─────────────────────────────────────
 /// 若 `DELETE FROM kv` 全删，本机的面板登录态、桌面设置、任务排期会一起消失 ——
 /// 用户下载一次云同步就被踢出登录。所以 kv 只删 `is_synced_kv_key` 命中的键。
-pub(crate) fn apply(db: &Db, snapshot: &Snapshot) -> Result<Value, String> {
+pub(crate) fn apply(
+    db: &Db,
+    snapshot: &Snapshot,
+    key: Option<&[u8; 32]>,
+) -> Result<(Value, String), String> {
     if snapshot.format != SNAPSHOT_FORMAT {
         return Err(format!(
             "远端快照格式不兼容（format = {}）",
@@ -296,18 +301,36 @@ pub(crate) fn apply(db: &Db, snapshot: &Snapshot) -> Result<Value, String> {
         ));
     }
 
-    let applied = db.with_mut(|conn| {
+    if !crate::server::config::model_key_source::pre_replace() {
+        return Err("模型Key原授权无法安全撤销，未应用同步快照".into());
+    }
+    // 同一实际连接锁内先撤销旧读来源并耐久轮换宿主epoch，再执行业务替换事务。
+    // epoch保留键与发送槽均不参与云同步；输入不能覆盖本机epoch，失败也不恢复旧资格。
+    let applied = db.with_account_change(|change| change.replace(|conn| {
         db.invalidate_accounts();
-        let applied = apply_conn(conn, snapshot);
+        let applied = apply_conn(conn, snapshot, key);
         db.invalidate_accounts();
         applied
-    })
-        .ok_or_else(|| "数据库连接不可用，无法应用同步快照".to_string())?;
+    }));
     db.invalidate_accounts();
-    applied
+    match applied {
+        Some(Ok(result)) => Ok(result),
+        Some(Err(error)) => {
+            crate::server::config::try_reload_from_db();
+            Err(error)
+        }
+        None => {
+            crate::server::config::try_reload_from_db();
+            Err("数据库连接不可用，无法应用同步快照".to_string())
+        }
+    }
 }
 
-fn apply_conn(conn: &mut Connection, snapshot: &Snapshot) -> Result<Value, String> {
+fn apply_conn(
+    conn: &mut Connection,
+    snapshot: &Snapshot,
+    key: Option<&[u8; 32]>,
+) -> Result<(Value, String), String> {
     let tx = conn
         .transaction()
         .map_err(|error| format!("开启同步应用事务失败: {error}"))?;
@@ -367,9 +390,11 @@ fn apply_conn(conn: &mut Connection, snapshot: &Snapshot) -> Result<Value, Strin
     }
     applied.insert("kv".to_string(), json!(snapshot.kv.len()));
 
+    // 在同一事务中读取实际恢复结果，避免把恢复后并发写入误记成已同步。
+    let content_hash = build_conn(&tx, snapshot.exported_at)?.content_hash(key)?;
     tx.commit()
         .map_err(|error| format!("提交同步应用事务失败: {error}"))?;
-    Ok(Value::Object(applied))
+    Ok((Value::Object(applied), content_hash))
 }
 
 fn insert_row(
@@ -535,6 +560,7 @@ mod tests {
             kv: BTreeMap::new(),
         };
         let (db, _guard) = crate::server::db::test_temp::TempDb::open("cloud-sync-newer-schema");
-        assert!(apply(&db, &snapshot).is_err());
+        assert!(apply(&db, &snapshot, None).is_err());
+        drop(db);
     }
 }

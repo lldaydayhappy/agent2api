@@ -44,6 +44,8 @@ pub struct AttemptDetail {
     pub notice: Option<String>,
     #[serde(rename = "bodyBytes", default)]
     pub body_bytes: Option<i64>,
+    #[serde(rename = "errorPolicy", default, skip_serializing_if = "Option::is_none")]
+    pub error_policy: Option<Value>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -75,8 +77,24 @@ impl TelemetrySnapshot {
 }
 
 impl RequestTelemetry {
-    pub fn set_route_decision(&self, decision: Value) {
+    /// 写入这次请求的选路快照。
+    ///
+    /// 有些键**不属于选路**，但同住这份快照：图片兼容（`visionCompatibility`）
+    /// 与特殊请求路由的改写记录（`compactRoute` / `titleRoute`）。它们在选路
+    /// 之前就已确定，而选路会在每轮重试时整份覆盖 —— 不在这里搬过去，
+    /// 回放页就只剩最后一次的选路结果，看不到「这条请求被改写过模型」。
+    const PRESERVED: &'static [&'static str] = &["visionCompatibility", "compactRoute", "titleRoute", "errorPolicyConfig"];
+
+    pub fn set_route_decision(&self, mut decision: Value) {
         let mut guard = self.lock();
+        let carried: Vec<(&'static str, Value)> = Self::PRESERVED.iter()
+            .filter_map(|key| guard.route.as_ref().and_then(|route| route.get(*key)).map(|value| (*key, value.clone())))
+            .collect();
+        if !carried.is_empty() {
+            if let Some(object) = decision.as_object_mut() {
+                for (key, value) in carried { object.insert(key.into(), value); }
+            }
+        }
         if guard.route.as_ref() == Some(&decision) { return; }
         guard.route = Some(decision);
         guard.route_revision = guard.route_revision.wrapping_add(1);
@@ -85,6 +103,18 @@ impl RequestTelemetry {
 
     pub fn route_decision(&self) -> Option<Value> {
         self.lock().route.clone()
+    }
+
+    pub fn note_error_policy(&self, policy: Value) {
+        let mut guard = self.lock();
+        if let Some(last) = guard.current_attempt_mut() {
+            let mut next = last.error_policy.take().filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+            if let (Some(object), Some(patch)) = (next.as_object_mut(), policy.as_object()) {
+                for (key, value) in patch { object.insert(key.clone(), value.clone()); }
+            }
+            last.error_policy = Some(next);
+        }
+        self.flush_live(&guard);
     }
 
     pub fn note_attempt_response(&self) {
@@ -112,7 +142,7 @@ impl RequestTelemetry {
             provider: provider.to_string(), account: truncate_chars(account, MAX_ATTEMPT_ACCOUNT_CHARS),
             account_id, candidate_id, member_id, model: String::new(), reasoning: String::new(), reason, sticky_hit,
             started_at: Some(crate::server::logging::now_ms()), response_at: None, finished_at: None,
-            status: None, error: None, retries: Vec::new(), notice: None, body_bytes: None,
+            status: None, error: None, retries: Vec::new(), notice: None, body_bytes: None, error_policy: None,
         });
         self.enter_phase(&mut guard, LogPhase::Waiting);
         self.flush_live(&guard);

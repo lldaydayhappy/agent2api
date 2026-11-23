@@ -131,7 +131,14 @@ impl AccountStore {
             if !value.is_object() {
                 return Err(AccountStoreError::bad_request("批量查询设置必须是 JSON 对象"));
             }
-            allowed.insert("usageQuery".to_string(), Self::normalize_usage_query(value)?);
+            let mut next = Self::normalize_usage_query(value)?;
+            if value.get("retries").is_none() {
+                if let Some(fields) = next.as_object_mut() { fields.remove("retries"); }
+            }
+            if value.get("timeoutSeconds").is_none() {
+                if let Some(fields) = next.as_object_mut() { fields.remove("timeoutSeconds"); }
+            }
+            allowed.insert("usageQuery".to_string(), next);
         }
         let limiter_mode = patch_object
             .get("limiterMode")
@@ -279,6 +286,11 @@ impl AccountStore {
                 tx.commit()
             })?;
         }
+        if allowed.contains_key("proxy") || allowed.contains_key("usageQuery") {
+            for record in &dirty {
+                crate::server::core::usage_query::jobs::invalidate_changed(record.id(), &crate::server::core::usage_query::config::fingerprint(record));
+            }
+        }
         // 写库完成后再动注册表（放锁，见 `disabled_catpaw` 的说明）
         drop(_guard);
         if limiter_mode.is_some() { limiter::counter::invalidate(); }
@@ -339,7 +351,8 @@ impl AccountStore {
                     .unwrap_or(false)
             })
             .count();
-        logging::log(
+        // 摘要可能包含「失败重试 → N 次」，不能靠文案推断级别，仅按实际失败数决定。
+        logging::log_with_level(
             "[Accounts]",
             &format!(
                 "🔀 批量修改 {} 个账号（{}）: 成功 {changed_count} 个{}{}",
@@ -356,6 +369,7 @@ impl AccountStore {
                     format!("，跳过 {} 个", skipped.len())
                 }
             ),
+            if failed.is_empty() { "info" } else { "error" },
         );
         Ok(json!({ "ok": ok, "failed": failed, "skipped": skipped, "list": snapshot }))
     }
@@ -426,7 +440,7 @@ impl AccountStore {
             .filter_map(|item| item.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join("、");
-        logging::log(
+        logging::log_with_level(
             "[Accounts]",
             &format!(
                 "🗑️  批量删除 {} 个账号: {}{}",
@@ -438,6 +452,7 @@ impl AccountStore {
                     format!("（{} 个不存在，已跳过）", failed.len())
                 }
             ),
+            "info",
         );
         // 落盘完成后作废这些账号的 CatPaw 会话映射（放锁，见本函数说明）
         drop(_guard);
@@ -445,5 +460,20 @@ impl AccountStore {
             self.invalidate_catpaw_sessions(&id, &provider);
         }
         Ok(json!({ "removed": removed, "failed": failed, "list": snapshot }))
+    }
+
+    /// 清理已由内置 API 模板替代的旧提供商残留账号（由用户在界面明确确认后触发）。
+    pub fn remove_retired_provider(&self, provider: &str) -> Result<Value, AccountStoreError> {
+        let ids: Vec<String> = self
+            .read_state()
+            .accounts
+            .iter()
+            .filter(|record| record.provider() == provider)
+            .map(|record| record.id().to_string())
+            .collect();
+        if ids.is_empty() {
+            return Ok(json!({ "removed": [], "failed": [], "list": self.list_visible_accounts() }));
+        }
+        self.batch_remove(&ids)
     }
 }

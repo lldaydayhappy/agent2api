@@ -130,6 +130,8 @@ pub use super::retry::RetryDecision;
 use std::sync::Arc;
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::proxies::ResolvedProxy;
+use crate::server::core::upstream::{ForwardOutcome, usage::RequestTelemetry};
 use crate::server::errors::GatewayError;
 
 use super::ProviderKind;
@@ -237,6 +239,8 @@ pub enum UpstreamResponse {
     /// OpenAI Chat SSE（默认）
     #[default]
     Chat,
+    /// OpenAI Responses SSE，跨协议出口复用 Responses → Chat 转换器。
+    Responses,
     /// Anthropic Messages SSE：下发前折回标准 chat SSE（见 `upstream::translate`）
     Anthropic,
     /// **AI SDK v5 风格 NDJSON**（`application/x-ndjson`）：一行一个 JSON 事件、
@@ -326,6 +330,64 @@ pub enum UpstreamErrorClass {
     },
 }
 
+/// 账号型网页搜索插件声明的能力边界（由 `web-search.capabilities` 返回）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebSearchCapability {
+    pub max_query_chars: usize,
+    pub supports_max_results: bool,
+    pub default_max_results: Option<usize>,
+    pub max_results_limit: Option<usize>,
+}
+
+impl WebSearchCapability {
+    /// 解析插件返回的 `web-search.capabilities` 元数据；旧版未申报条数参数时保持兼容关闭。
+    pub fn from_metadata(metadata: &Value) -> Option<Self> {
+        if metadata.get("version").and_then(Value::as_u64) != Some(1)
+            || metadata.get("search").and_then(Value::as_bool) != Some(true)
+        {
+            return None;
+        }
+        let max_query_chars = metadata
+            .get("max_query_chars")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| (1..=16000).contains(value))?;
+        let supports_max_results = metadata
+            .get("supports_max_results")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let max_results_limit = if supports_max_results {
+            metadata
+                .get("max_results_limit")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| (1..=1000).contains(value))
+                .or(Some(10))
+        } else {
+            None
+        };
+        let default_max_results = if supports_max_results {
+            let limit = max_results_limit.unwrap_or(10);
+            Some(
+                metadata
+                    .get("default_max_results")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .map(|value| value.clamp(1, limit))
+                    .unwrap_or_else(|| limit.min(10)),
+            )
+        } else {
+            None
+        };
+        Some(Self {
+            max_query_chars,
+            supports_max_results,
+            default_max_results,
+            max_results_limit,
+        })
+    }
+}
+
 /// 一次「可退避重试」的建议（见模块头扩展 1）。
 ///
 /// 适配器把「要不要退避重试」连同**原因**一起给出，编排层负责睡这一觉、
@@ -353,7 +415,7 @@ pub struct RetryAdvice {
 ///
 /// ── 为什么是「要么一个字段、要么一个原因」而不是 `Option<Value>` ──
 /// 注入点（`upstream::payload`）要做两件事：改写 body、**把结果记进详细日志**。
-/// 「不注入」有四五种成因（这家不支持 / 客户端已指定 / 等级不在能力范围内 /
+/// 「不注入」有多种成因（这家不支持 / 等级不在能力范围内 /
 /// 该等级语义是关闭思考……），对用户来说原因完全不同 —— 用 `Option` 会让
 /// 日志只能写一句「未注入」，那正是「我绑了为什么不生效」最难查的情形。
 /// 把原因做成返回值的一部分，适配器就必须为自己的判断给出一句话。
@@ -372,8 +434,8 @@ pub enum ReasoningPatch {
     },
     /// 不注入（body 一个字节都不动，保持本功能之前的行为）。`reason` 进详细日志。
     Skip {
-        /// 给用户看的一句话原因（「这家不支持思考等级」/「客户端请求体里已指定」
-        /// /「该等级不在本家接受的档位内」……）。
+        /// 给用户看的一句话原因（「这家不支持思考等级」/
+        /// 「该等级不在本家接受的档位内」……）。
         reason: &'static str,
     },
 }
@@ -514,6 +576,24 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
+    fn web_search_capability(&self) -> Option<WebSearchCapability> {
+        None
+    }
+
+    fn forwards_images(&self) -> bool { false }
+
+    fn forward_images<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _body: &'a Value,
+        _client_headers: &'a HeaderMap,
+        _proxy: Option<ResolvedProxy>,
+        _operation: super::images::ImageOperation,
+        _telemetry: &'a Arc<RequestTelemetry>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ForwardOutcome, GatewayError>> + Send + 'a>> {
+        Box::pin(async { Err(GatewayError::with_status(501, "提供商尚未实现标准图片通道")) })
+    }
+
     fn build_image_request_async<'a>(
         &'a self,
         _account: &'a Value,
@@ -533,9 +613,8 @@ pub trait ProviderAdapter: Send + Sync {
     /// ── 调用时机与调用者 ────────────────────────────────────────
     /// `upstream::payload::send_body`：某一家 provider 的凭证已就绪、即将发送，
     /// 在按家改写完模型名之后调一次（**与模型名改写同一步**，因为等级与发送名
-    /// 来自同一条映射，见 `catalog::WireTarget`）。注入点只做三件事：把
-    /// `level` 原样递进来、按返回结果改写 body、把 `reason` 记进详细日志。
-    /// 它不认识任何一家的字段名，也不做任何「档位该叫什么」的判断。
+    /// 来自同一条映射，见 `catalog::WireTarget`）。注入点把 `level` 与清理后的
+    /// 请求副本递进来，按返回结果提交覆盖并记录原因；档位归一由适配器负责。
     ///
     /// ── `level` 是什么、不是什么（实现必须先读这段）────────────────
     /// 传进来的是**映射上原样存着的那个字符串**（已过 `normalize`：去空白、
@@ -557,14 +636,10 @@ pub trait ProviderAdapter: Send + Sync {
     /// 默认实现返回 `Skip`。字段名和模型档位范围必须由实现确认，不能仅凭
     /// supportsReasoning 推断可调；WorkBuddy 的判定与归一在提供商插件内。
     ///
-    /// ── 实现必须自己判的第三条：客户端是不是已经指定了 ──────────────
-    /// 客户端在请求体里显式传了档位（CatPaw 的 `reasoning_effort` /
-    /// `reasoningEffort` / `effort`，Qoder 的 `reasoning_effort` / `reasoning` /
-    /// `thinking`）时，绑定**不覆盖**它 —— 那是用户的明确意图，比映射上的默认值
-    /// 更具体。判据请**直接复用本家那个 resolver**（`catpaw::models::resolve_effort`
-    /// 的取值链、`qoder::protocol::resolve_thinking` 读的那三个键），不要在这里
-    /// 另抄一份键名清单：抄一份的下场是上游将来加一个别名时，绑定会开始覆盖
-    /// 一个「客户端其实已经指定了」的请求，而那种错误没有任何日志会提示。
+    /// ── 覆盖优先级与请求体 ──────────────────────────────────────
+    /// 映射绑定优先于客户端参数。宿主传入已清理客户端思考控制字段的副本，
+    /// 实现只判断模型能力与等级取值，不因客户端原先有档位而跳过。
+    /// 只有返回 `Set` 后，宿主才提交清理与覆盖；`Skip` 保留原发送体。
     ///
     /// ── 与 `build_chat_request` 的分工（为什么不做成后者的参数）──────
     /// 那个方法的入参是「账号 + 客户端原始 body」，而等级来自**映射**、由
@@ -603,19 +678,14 @@ pub trait ProviderAdapter: Send + Sync {
     /// ── 调用时机与读的是哪份 body ─────────────────────────────
     /// `upstream::payload::send_body` 在按家改写模型名、注入映射绑定的等级
     /// （[`Self::reasoning_patch`]）**之后**调用一次。此时 body 顶层的等级字段
-    /// 要么是客户端显式传的原值（绑定让位时），要么是绑定注入的值 ——
+    /// 要么是未覆盖时保留的客户端原值，要么是绑定注入的值 ——
     /// 读出来的就是上游收到的档位：覆写的家（CatPaw / Qoder）用**本家
     /// resolver 的同一条取值链**读，与转发行为完全同源；默认实现读的是
     /// 透传字段（见下）。
     ///
     /// ── 为什么默认读透传字段（而不是 None）─────────────────────
-    /// `send_body` 只改写 model 名、注入映射绑定的等级，**不删客户端字段**：
-    /// 客户端显式指定的等级（`reasoning_effort` 等通用键）对每一家都原样
-    /// 随发送体上行 —— 那就是实际发出去的档位，与接不接绑定是两回事
-    /// （「不接」说的是不**注入**，见 [`Self::reasoning_patch`] 的默认 `Skip`；
-    /// 客户端自己传的字段没有理由在显示上抹掉）。默认实现因此用展示侧
-    /// 读取器的并集链读发送体；「关闭思考」两档不算随行档位（与 Qoder
-    /// 覆写同一口径），不预支一个「没发出去」的值。
+    /// 未绑定或无法注入时，客户端显式指定的等级仍随发送体上行；默认读取器
+    /// 展示这些透传字段，不因提供商未接入绑定而抹掉。关闭思考两档不算随行档位。
     ///
     /// ── 显示值与真实字节的边界 ─────────────────────────────────
     /// 返回的是「随请求上行的档位意图值」。Qoder 的协议层还会按模型声明的
@@ -976,6 +1046,17 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
+    /// 带最小提前量（毫秒）的临期判定；供凭证维护把窗口放大到覆盖维护间隔，
+    /// 不改变转发按需续期使用的 [`Self::credentials_expiring`]。
+    fn credentials_expiring_within(
+        &self,
+        store: &AccountStore,
+        account_id: &str,
+        _min_lead_ms: i64,
+    ) -> bool {
+        self.credentials_expiring(store, account_id)
+    }
+
     /// [`Self::credentials_expiring`] 的异步形态（插件架构新增，理由同
     /// [`Self::build_chat_request_async`]）。
     ///
@@ -991,6 +1072,30 @@ pub trait ProviderAdapter: Send + Sync {
         account_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(async move { self.credentials_expiring(store, account_id) })
+    }
+
+    /// 维护任务保留检查失败的原因；失败不表示未到期，也不允许据此发送续期请求。
+    fn check_credentials_expiring<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.credentials_expiring_async(store, account_id).await) })
+    }
+
+    /// 带最小提前量（毫秒）的异步临期检查；供凭证维护把窗口放大到覆盖维护间隔。
+    fn check_credentials_expiring_within<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        min_lead_ms: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        Box::pin(async move {
+            if min_lead_ms <= 0 {
+                return self.check_credentials_expiring(store, account_id).await;
+            }
+            Ok(self.credentials_expiring_within(store, account_id, min_lead_ms))
+        })
     }
 
     /// 本 provider 是否允许「一个账号都没有时用默认登录态转发」
@@ -1076,6 +1181,15 @@ pub trait ProviderAdapter: Send + Sync {
     /// CodeArts / Trae / Kuku / MonkeyCode，见各自 `mod.rs` 的模块头）。
     fn is_stateful(&self) -> bool {
         false
+    }
+
+    /// 私有响应由插件归一；这不意味着上游一定有持久会话。
+    fn forwards_response(&self) -> bool {
+        self.is_stateful()
+    }
+
+    fn supports_account_user_agent(&self) -> bool {
+        !self.forwards_response()
     }
 
     /// **会话式转发入口**（模块头扩展 6 的配套；架构文档 §4.2.1）。
@@ -1240,6 +1354,21 @@ pub trait ProviderAdapter: Send + Sync {
         Box::pin(async move { Ok(self.login_start_async().await) })
     }
 
+    /// 可取消的参数化登录启动：取消令牌触发时同时中止进行中的跨进程 RPC。
+    fn build_login_flow_with_options_cancellable<'a>(
+        &'a self,
+        options: Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<agent2api_provider_protocol::LoginStart>, GatewayError>>
+                + Send + 'a,
+        >,
+    > {
+        let _ = cancel;
+        self.build_login_flow_with_options(options)
+    }
+
     /// 轮询一次登录进度（**轮询型流程用**，插件架构新增）。
     ///
     /// 只有平台把 `poll_interval_ms` 报成 `> 0` 时才会被调用。默认返回错误：
@@ -1282,6 +1411,18 @@ pub trait ProviderAdapter: Send + Sync {
             501,
             "该提供商不支持直接落库登录结果：这是内部契约错误",
         ))
+    }
+
+    /// 登录凭证与账号代理必须同次保存；执行体未实现时不能静默丢弃代理。
+    fn persist_login_account_with_proxy(
+        &self,
+        account: &agent2api_provider_protocol::NormalizedAccount,
+        proxy: Option<&Value>,
+    ) -> Result<String, GatewayError> {
+        if proxy.is_some() {
+            return Err(GatewayError::with_status(501, "该提供商尚不支持同时保存登录账号与代理，请更新提供商"));
+        }
+        self.persist_login_account(account)
     }
 
     /// 用回调里的一次性 `code` 换取凭证并**存入账号库**，成功返回账号 id
@@ -1331,6 +1472,21 @@ pub trait ProviderAdapter: Send + Sync {
         >,
     > {
         Box::pin(async { Ok(None) })
+    }
+
+    /// 扩展回调结果保留下一步授权与重新填写语义，旧适配器无需改动。
+    fn login_callback_result_async<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        callback: agent2api_provider_protocol::LoginCallback,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<
+            Output = Result<Option<crate::server::core::login::LoginCallbackResult>, GatewayError>,
+        > + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.login_callback_poll_async(store, callback).await.map(|poll| poll.map(Into::into))
+        })
     }
 
     /// 取消插件侧登录流程（释放监听端口及暂存凭证），不删除已落库账号。
@@ -1553,6 +1709,60 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
 
+    /// 托管登录只走主程序签发的 Call；默认不把可信事件降级成普通 JSON 管理动作。
+    fn supports_managed_login(&self, _method_index: u64) -> bool { false }
+
+    /// 等待真人期间仅固定执行体身份，不长期占用普通在途调用许可阻止卸载。
+    fn managed_login_owner(&self) -> Option<std::sync::Arc<dyn ProviderAdapter>> { None }
+
+    fn prepare_managed_login(&self, _call: &crate::server::core::login::managed::Call) -> Result<(), GatewayError> {
+        Err(GatewayError::with_status(501, "当前执行体未接入托管登录"))
+    }
+
+    fn managed_login_action<'a>(
+        &'a self,
+        _call: &'a crate::server::core::login::managed::Call,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>> {
+        Box::pin(async { Err(GatewayError::with_status(501, "当前执行体未接入托管登录")) })
+    }
+
+    /// 主程序已绑定短信任务的窄调用；凭据不能由前端载荷构造。
+    /// 旧原生/脚本适配器保持现有管理动作形状，Wasm 单独校验并注入可信上下文。
+    fn sms_action<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        call: &'a crate::server::core::login::sms::Call,
+        action: &'a str,
+        payload: &'a Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>> {
+        Box::pin(async move {
+            call.validate_adapter(self)?;
+            call.validate_action(action, payload)?;
+            self.admin_action(store, "", action, payload).await
+        })
+    }
+
+    /// 主程序模型验证码提交入口；默认不让普通管理调用取得交互通道。
+    fn verification_action<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        _account_id: &'a str,
+        _payload: &'a Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>> {
+        Box::pin(async { Err(GatewayError::with_status(501, "当前执行体不支持账号验证码提交")) })
+    }
+
+    /// 主程序领取验证入口；固定轮询/回传动作，不影响既有模型验证码签名。
+    fn claim_verification_action<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        _account_id: &'a str,
+        _complete: bool,
+        _payload: &'a Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>> {
+        Box::pin(async { Err(GatewayError::with_status(501, "当前执行体不支持领取验证码交互")) })
+    }
+
     /// **厂商专属的管理动作**（成长任务 / 每日活跃保活 / 平台福利 / 套餐领取…）。
     ///
     /// ── 为什么是一条通道 ────────────────────────────────────────
@@ -1616,22 +1826,14 @@ pub fn usage_not_configured(provider_label: &str, field_hint: &str) -> GatewayEr
     .with_code(USAGE_NOT_CONFIGURED_CODE)
 }
 
-/// 注册表：provider → 适配器实现。
-///
-/// ── 这里现在只有一件事：返回占位 ──────────────────────────────
-/// 29 个 `ProviderKind` 的实现**全部**搬到了提供商插件（`agent2api-providers`，
-/// 不随本仓库发布）。网关没有任何内置转发 / 账号解析实现可返回，所以本函数
-/// 对任何 kind 都返回 [`missing_plugin::placeholder`] —— 它如实报「需安装
-/// 插件」，而不是在网关里留一份会随时间漂移的旁路实现。
-///
-/// 保留这个函数（而不是让调用点直接拿占位）是因为它是适配器层的**唯一入口**：
-/// 将来若真要接回某个内置实现，改动只在这里；反过来，任何人想往网关里塞
-/// 「怎么打某个上游」的代码，都必须先改这里 —— review 时一眼能看见。
-///
-/// 硬约束：**不要**在这里加任何真实现。插件缺失时如实报错是产品语义的一部分
-/// （见 `missing_plugin` 的模块头），不是待补的坑。
+/// 编译进主程序的订阅实现；旧提供商仍返回缺插件占位。
 pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
-    crate::server::core::providers::missing_plugin::placeholder(kind)
+    match kind {
+        ProviderKind::ClaudeSubscription => &super::claude_subscription::ADAPTER,
+        ProviderKind::ChatgptSubscription => &super::chatgpt_subscription::ADAPTER,
+        ProviderKind::CodexSubscription => &super::codex_subscription::ADAPTER,
+        _ => super::missing_plugin::placeholder(kind),
+    }
 }
 
 /// 运行时注册表：provider id → 适配器（插件架构新增）。
@@ -1660,7 +1862,8 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
 /// （迁移期对照、插件实现出问题时的诊断入口）用它，而不是依赖这里的优先级。
 pub fn adapter_by_id(id: &str) -> Option<Arc<dyn ProviderAdapter>> {
     if super::availability::is_suspended(id) { return None; }
-    // 插件家优先（见上面第 3 条：没装/停用时自然落到内置）
+    if let Some(adapter) = super::subscriptions::adapter(id) { return Some(adapter); }
+    // 旧提供商仍由插件执行。
     if let Some(adapter) = crate::server::core::plugin_host::lookup(id) {
         return Some(adapter);
     }
@@ -1670,6 +1873,7 @@ pub fn adapter_by_id(id: &str) -> Option<Arc<dyn ProviderAdapter>> {
 
 pub async fn adapter_by_id_ready(id: &str) -> Result<Option<Arc<dyn ProviderAdapter>>, GatewayError> {
     if super::availability::is_suspended(id) { return Ok(None); }
+    if let Some(adapter) = super::subscriptions::adapter(id) { return Ok(Some(adapter)); }
     if let Some(adapter) = crate::server::core::plugin_host::lookup_ready(id).await? {
         return Ok(Some(adapter));
     }
@@ -1683,7 +1887,7 @@ pub async fn adapter_by_id_ready(id: &str) -> Result<Option<Arc<dyn ProviderAdap
 /// 诊断对照、以及任何「想知道这家有没有编译进网关」的判定。
 /// 生产转发路径一律用 [`adapter_by_id`]（插件优先）。
 pub fn builtin_adapter_by_id(id: &str) -> Option<Arc<dyn ProviderAdapter>> {
-    super::kind_from_id(id).map(Into::into)
+    super::subscriptions::adapter(id).or_else(|| super::kind_from_id(id).map(Into::into))
 }
 
 /// 内置家的 `Arc` 包装（让 `adapter_by_id` 的返回类型统一）。
@@ -1822,6 +2026,10 @@ impl ProviderAdapter for BuiltinAdapter {
         adapter_for(self.0).supports_image_editing()
     }
 
+    fn web_search_capability(&self) -> Option<WebSearchCapability> {
+        adapter_for(self.0).web_search_capability()
+    }
+
     fn build_image_request_async<'a>(
         &'a self,
         account: &'a Value,
@@ -1887,12 +2095,38 @@ impl ProviderAdapter for BuiltinAdapter {
         adapter_for(self.0).credentials_expiring(store, account_id)
     }
 
+    fn credentials_expiring_within(
+        &self,
+        store: &AccountStore,
+        account_id: &str,
+        min_lead_ms: i64,
+    ) -> bool {
+        adapter_for(self.0).credentials_expiring_within(store, account_id, min_lead_ms)
+    }
+
     fn credentials_expiring_async<'a>(
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         adapter_for(self.0).credentials_expiring_async(store, account_id)
+    }
+
+    fn check_credentials_expiring<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        adapter_for(self.0).check_credentials_expiring(store, account_id)
+    }
+
+    fn check_credentials_expiring_within<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        min_lead_ms: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        adapter_for(self.0).check_credentials_expiring_within(store, account_id, min_lead_ms)
     }
 
     fn allows_anonymous_default_session(&self) -> bool {
@@ -1921,6 +2155,12 @@ impl ProviderAdapter for BuiltinAdapter {
 
     fn is_stateful(&self) -> bool {
         adapter_for(self.0).is_stateful()
+    }
+    fn forwards_response(&self) -> bool {
+        adapter_for(self.0).forwards_response()
+    }
+    fn supports_account_user_agent(&self) -> bool {
+        adapter_for(self.0).supports_account_user_agent()
     }
 
     fn forward_conversation<'a>(
@@ -2000,6 +2240,19 @@ impl ProviderAdapter for BuiltinAdapter {
         adapter_for(self.0).build_login_flow_with_options(options)
     }
 
+    fn build_login_flow_with_options_cancellable<'a>(
+        &'a self,
+        options: Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<agent2api_provider_protocol::LoginStart>, GatewayError>>
+                + Send + 'a,
+        >,
+    > {
+        adapter_for(self.0).build_login_flow_with_options_cancellable(options, cancel)
+    }
+
     fn login_callback_poll_async<'a>(
         &'a self,
         store: &'a AccountStore,
@@ -2011,6 +2264,18 @@ impl ProviderAdapter for BuiltinAdapter {
         >,
     > {
         adapter_for(self.0).login_callback_poll_async(store, callback)
+    }
+
+    fn login_callback_result_async<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        callback: agent2api_provider_protocol::LoginCallback,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<
+            Output = Result<Option<crate::server::core::login::LoginCallbackResult>, GatewayError>,
+        > + Send + 'a>,
+    > {
+        adapter_for(self.0).login_callback_result_async(store, callback)
     }
 
     fn login_cancel_async<'a>(
@@ -2042,6 +2307,14 @@ impl ProviderAdapter for BuiltinAdapter {
     ) -> Result<String, GatewayError> {
         // 内置家的登录都在自己的 `start_*_login` 里落库，走不到这里
         adapter_for(self.0).persist_login_account(account)
+    }
+
+    fn persist_login_account_with_proxy(
+        &self,
+        account: &agent2api_provider_protocol::NormalizedAccount,
+        proxy: Option<&Value>,
+    ) -> Result<String, GatewayError> {
+        adapter_for(self.0).persist_login_account_with_proxy(account, proxy)
     }
 
     fn normalize_account<'a>(
@@ -2133,22 +2406,9 @@ impl ProviderAdapter for BuiltinAdapter {
     }
 }
 
-/// 已**完整实现**的适配器对应的 kind 列表（顺序 = 注册表顺序）。
-///
-/// ── 现在恒为空，且这是**终点状态** ────────────────────────────
-/// 这个函数回答的问题是「网关编译进去的执行体还剩哪几家」。全部提供商的转发与
-/// 账号实现都已搬到独立的提供商插件（`agent2api-providers`，不随本仓库发布），
-/// 所以答案就是「一家都不剩」。
-///
-/// 保留空实现而不是删掉函数：它的两个消费方（`catalog_refresh` 的逐家刷新与
-/// `reschedule`）都是「遍历内置家」的形状，删掉函数会让那两处改写成
-/// `if false` 之类的形状，反而不如一张空表读得明白。**不要往这张表里加东西**
-/// —— 往里加一家，等于把该家的实现重新带回网关，正是拆家要消除的东西。
-///
-/// 插件家不走这里：`catalog_refresh` 另有基于 `plugin_host::installed_ids()` 的
-/// 第二段循环，与内置家共用同一套「支持才刷」的判据。
+/// 编译进网关的真实执行体；旧身份占位不参与后台刷新。
 pub fn implemented_kinds() -> Vec<ProviderKind> {
-    Vec::new()
+    super::subscriptions::KINDS.to_vec()
 }
 
 /// 一次模型目录刷新的结果（模块头扩展 9）。

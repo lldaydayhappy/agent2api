@@ -17,24 +17,12 @@
  */
 
 import type { SanitizePatch } from './settings-sanitize-model'
+import type { CaptchaSetting, CaptchaPatch } from '../../../ui-shared/panel-captcha'
+export type { CaptchaSetting, CaptchaPatch } from '../../../ui-shared/panel-captcha'
 import { t } from '../i18n'
 
 
 // ── 从 HEAD 恢复的类型（桥成员的返回形状）──────────────
-
-/** 机器人校验状态（`/api/captcha`）：两端各一个开关 + 本进程形态 */
-export type CaptchaSetting = {
-  captchaDesktop?: boolean
-  captchaWeb?: boolean
-  /** true = 本进程是桌面壳；false = headless（Docker / 服务端） */
-  localPanel?: boolean
-}
-
-/** 写入机器人校验：两个字段都可选，缺省的那一端不改 */
-export type CaptchaPatch = {
-  captchaDesktop?: boolean
-  captchaWeb?: boolean
-}
 
 /** 面板账户信息（`/api/panel/account`） */
 export type PanelAccount = {
@@ -119,15 +107,13 @@ type ModelsDevView = {
 }
 
 /**
- * models.dev 面板的状态行：把「开关 + 数据来历 + 生成时刻 + 条数」写成一句话。
- *
- * 为什么不只写「已开启」：这个开关的价值全在**那份元数据是什么时候的、有多少
- * 条** —— 只报开关状态，用户没法判断「我的档位为什么还是老样子」是没开、
- * 是没拉到、还是这份快照本来就旧。
+ * models.dev 面板的状态行：把「数据来历 + 生成时刻 + 自动更新开关」写成一句话，
+ * 刷新进行中提示正在更新；总条数已由卡片右上角徽章展示，这里不再重复。
  */
-export function modelsDevStateText(state: ModelsDevView): string {
+export function modelsDevStateText(state: ModelsDevView, refreshing = false): string {
   if (state.status === 'loading') return STATES.appLoading
   if (state.status === 'unavailable') return STATES.modelsDevUnavailable
+  if (refreshing) return STATES.modelsDevRefreshing
   const origin = state.source === 'builtin'
     ? STATES.modelsDevSourceBuiltin
     : state.source === 'cache'
@@ -141,14 +127,11 @@ export function modelsDevStateText(state: ModelsDevView): string {
     ? String(shared().wbApp?.formatTime?.(state.updatedAt) ?? '')
     : ''
   if (!origin && !stamp && !state.count) return STATES.modelsDevEmpty
-  const at = stamp ? t('，{time}', { time: stamp }) : ''
-  const mode = state.enabled ? t('正在联网更新') : t('仅用现有数据、不联网刷新')
-  return t('{count} 条 · 来自{origin}{at} · {mode}', {
-    count: Number(state.count).toLocaleString('zh-CN'),
-    origin: origin || t('未知来源'),
-    at,
-    mode,
-  })
+  const source = origin || t('未知来源')
+  const mode = state.enabled ? t('自动更新已开启') : t('仅用本地数据')
+  return stamp
+    ? t('当前数据：{origin} · {time} · {mode}', { origin: source, time: stamp, mode })
+    : t('当前数据：{origin} · {mode}', { origin: source, mode })
 }
 
 /* ─── 桥与共享全局 ─────────────────────────── */
@@ -157,12 +140,21 @@ export function modelsDevStateText(state: ModelsDevView): string {
 export type AppSettings = {
   closeToTray: boolean
   autostart: boolean
-  /** 局域网访问：监听 0.0.0.0（改动随「应用重启」生效，见 TIPS.lan） */
+  /** 局域网访问：监听 0.0.0.0（改动随「应用重启」生效，见 TIPS.networkAccess） */
   lanAccess: boolean
   /** 局域网访问开启时是否同时托管网页管理面板（同样随重启生效） */
   lanPanel: boolean
   /** 轻量模式：关窗销毁界面进程（释放 WebView2 内存），托盘按需重建 */
   lightweightMode: boolean
+  hardwareAcceleration: boolean
+}
+
+export type GraphicsSettings = {
+  enabled: boolean
+  active: boolean
+  environmentOverride: boolean
+  compatibilityMode: boolean
+  restartRequired: boolean
 }
 
 /**
@@ -220,8 +212,6 @@ export type SystemInfo = {
     allowNoKey?: boolean | null
     v1FailClosed?: boolean | null
     panelGate?: boolean | null
-    githubTokenFilled?: boolean | null
-    githubTokenOrigin?: string | null
     updateProxy?: boolean | null
   }
   features?: {
@@ -229,6 +219,7 @@ export type SystemInfo = {
     sanitizeFingerprints?: boolean | null
     cors?: boolean | null
     developerRoleCompat?: boolean | null
+    thirdPartyReasoningCollapse?: boolean | null
     keepaliveStrip?: boolean | null
     autoContinue?: boolean | null
     autoContinueMaxRounds?: number | null
@@ -254,6 +245,8 @@ export type ImportError = { id?: string; message?: string; customProvider?: bool
 /** 导入结果（壳命令 import_accounts） */
 export type ImportResult = {
   canceled?: boolean
+  importNotice?: string
+  warning?: string
   total?: number
   added?: number
   updated?: number
@@ -331,6 +324,8 @@ export type SettingsBridge = {
   platform?: string
   getAppSettings(): Promise<AppSettings | null | undefined>
   saveAppSettings(patch: AppSettings): Promise<AppSettings | null | undefined>
+  getGraphicsSettings?(): Promise<GraphicsSettings>
+  saveGraphicsSettings?(enabled: boolean): Promise<void>
   exportAccounts(): Promise<ExportResult | null | undefined>
   importAccounts(): Promise<ImportResult | null | undefined>
   getRetention(): Promise<unknown>
@@ -347,12 +342,14 @@ export type SettingsBridge = {
   saveDebug(enabled: boolean): Promise<unknown>
   getSanitize(): Promise<unknown>
   saveSanitize(patch: boolean | SanitizePatch): Promise<unknown>
+  getWebToolEmulation?(): Promise<unknown>
+  saveWebToolEmulation?(enabled: boolean): Promise<unknown>
   getDeveloperRoleCompat(): Promise<unknown>
   saveDeveloperRoleCompat(enabled: boolean): Promise<unknown>
+  getReasoningCollapse(): Promise<unknown>
+  saveReasoningCollapse(enabled: boolean): Promise<unknown>
   getClineHeaders(): Promise<unknown>
   saveClineHeaders(overrides: Record<string, string>): Promise<unknown>
-  getZcodeVersion(): Promise<unknown>
-  saveZcodeVersion(version: string): Promise<unknown>
   getCors(): Promise<unknown>
   saveCors(enabled: boolean): Promise<unknown>
   getPrompt(): Promise<unknown>
@@ -412,6 +409,13 @@ export type SettingsBridge = {
     cloudSyncUpload?(): Promise<unknown>
     cloudSyncDownload?(): Promise<unknown>
     importCloudSyncKey?(password: string): Promise<unknown>
+    getNotifications?(): Promise<unknown>
+    saveNotifications?(payload: Record<string, unknown>): Promise<unknown>
+    testNotification?(payload: Record<string, unknown>): Promise<unknown>
+    getOauthSettings?(): Promise<unknown>
+    saveOauthSettings?(payload: Record<string, unknown>): Promise<unknown>
+    startOauthBind?(payload: Record<string, unknown>): Promise<unknown>
+    pollOauthState?(state: string): Promise<unknown>
 }
 
 /**
@@ -425,7 +429,7 @@ export type SettingsBridge = {
 export type SharedWindow = {
   workbuddyDesktop?: SettingsBridge
   wbApp?: {
-    toast?: (message: string, kind?: 'err' | 'ok') => void
+    toast?: (message: string, kind?: 'err' | 'ok' | 'warn') => void
     /** 账号被导入改动后让主界面重绘（账号列表、导航计数） */
     refresh?: () => Promise<void> | void
     /** 当前页标识：脚本加载时若已停在设置页，补一次 load() */
@@ -440,7 +444,7 @@ export type SharedWindow = {
   /** Token 计量单位的展示口径（units.js）：本页只负责拨开关，格式化在那边 */
   wbUnits?: { isChinese?: () => boolean; setChinese?: (on: boolean) => void }
   /** 软件更新面板的岛（update-panel.tsx）：切到设置页时让它自己刷新一次 */
-  wbUpdatePanel?: { load?: () => Promise<void> | void }
+  wbUpdatePanel?: { load?: () => Promise<void> | void; check?: () => Promise<unknown> }
   /** 版本信息面板的岛（system-info-pane.tsx）：同上 */
   wbSystemInfoPane?: { load?: () => Promise<void> | void }
   /** 内联图标集（icons.js）：左栏分类图标由它渲染（返回 SVG 串，注入用） */
@@ -457,7 +461,7 @@ export function errorMessage(error: unknown): string {
 }
 
 /** toast 的统一出口（运行期读 wbApp，不在模块顶层解构） */
-export function toast(message: string, kind?: 'err' | 'ok'): void {
+export function toast(message: string, kind?: 'err' | 'ok' | 'warn'): void {
   shared().wbApp?.toast?.(message, kind)
 }
 
@@ -501,6 +505,7 @@ export async function openExternal(url: string): Promise<void> {
  */
 export const CATEGORIES = [
   { id: 'account', label: t('账户'), icon: 'accounts' },
+  { id: 'notifications', label: t('通知'), icon: 'bell' },
   { id: 'general', label: t('通用'), icon: 'sliders' },
   // 注：AI 助手的配置（对话模型 / 系统提示词 / 工具勾选）已搬到助手页自己的
   // 「助手设置」抽屉（见 assistant-settings-drawer.tsx）—— 那几项都是聊着聊着
@@ -508,7 +513,7 @@ export const CATEGORIES = [
   // 老用户 localStorage 里存着的 'assistant' 由 settings-state 的兜底回落到首项。
   { id: 'display', label: t('显示'), icon: 'display' },
   { id: 'gateway', label: t('网关'), icon: 'traffic' },
-  { id: 'retry', label: t('重试'), icon: 'refresh' },
+  { id: 'providers', label: t('提供商'), icon: 'sliders' },
   { id: 'timeout', label: t('超时'), icon: 'timer' },
   { id: 'security', label: t('安全'), icon: 'shield' },
   { id: 'data', label: t('数据'), icon: 'database' },
@@ -809,6 +814,7 @@ export function normalizeApp(saved: unknown, fallback: AppSettings): AppSettings
     if (typeof record.lanAccess === 'boolean') result.lanAccess = record.lanAccess
     if (typeof record.lanPanel === 'boolean') result.lanPanel = record.lanPanel
     if (typeof record.lightweightMode === 'boolean') result.lightweightMode = record.lightweightMode
+    if (typeof record.hardwareAcceleration === 'boolean') result.hardwareAcceleration = record.hardwareAcceleration
   }
   return result
 }
@@ -869,20 +875,20 @@ export const TIPS = {
   accountList: t('账号页表格的两项显示偏好，只存在本机（localStorage），不影响账号数据与转发。「积分合计只统计当前筛选出来的账号」：账号页每一家的分组带右侧有一枚「可用合计」，默认按整组求和 —— 不受筛选、搜索影响，被筛掉的账号也计入（余额是资产，禁用也只表示不参与转发，额度仍在账上）。打开这一项后改为只累加当前可见的行：例如筛出 1 个 100 积分的账号，合计就是 100，而不是同组两个账号之和 1,000。分页不参与这个口径 —— 翻页看的是同一份结果的不同屏，合计不随页码变化。「隐藏账号名」与表头「账号」旁边那颗眼睛是同一个开关：打开后账号列的名字整体显示成星号，适合截图分享时遮挡账号。') + ' ' + t('百分比类读数（如 OpenCode Go、Antigravity）不能相加，组头显示的是组内最低剩余比例。'),
   tray: t('默认关闭窗口不会退出程序，而是把窗口缩到系统托盘，转发继续在后台运行（OpenAI 客户端不受影响）；要彻底退出程序，请在托盘图标上右键选「退出」。关掉这个开关后，点关闭按钮即退出程序、转发随之中断。「开机自动启动」开启后，登录系统时会自动启动本程序（通常直接驻留托盘），不需要手动打开。'),
   lightweight: t('开启后，关闭窗口会销毁界面并释放 WebView 进程，网关转发、定时签到、余额查询仍在后台继续。ZCode 模型请求免验证时不受影响；上游要求人机验证时，需要重新打开界面，在账号的「套餐明细」中主动完成验证。此开关只在「关闭窗口时最小化到托盘」开启时有意义。'),
-  lan: t('默认网关只监听 127.0.0.1，只有本机能访问。开启后网关改听所有网卡，同一局域网内的设备可以把 API 地址指向本机 IP 一起使用。出于安全考虑，开启前必须先注册一个面板管理员：管理接口从此要求管理员会话或网关 Key，模型额度不会对局域网裸奔；一把启用的网关 Key 都没有时，转发接口也会拒绝服务，直到创建第一把。改动需要重启应用生效。「同时开放网页管理面板」把管理界面也出给局域网（其他设备的浏览器打开本机 IP 即可管理），默认关闭 —— 桌面端的面板仍只由本程序自己出。'),
+  networkAccess: t('默认仅本机可访问（127.0.0.1）。开启后监听所有 IPv4 网卡（0.0.0.0），访问范围由网络与防火墙决定，不限于局域网，也不会自动开放到公网。开启前必须注册面板管理员；管理接口需要管理员会话或网关 Key，API 调用需要启用的网关 Key，没有时会自动创建一把「默认」Key。「同时开放网页管理面板」默认关闭，开启后可从其他设备的浏览器登录管理；关闭它不影响 API 转发和本机桌面管理。修改任一开关都需要重启应用。'),
   units: t('控制报表与请求日志里 Token 读数的写法：开启后按中文量级显示（1.2亿 / 8400万），关闭则用 k / M / B 缩写（与上游文档、接口字段的写法一致）。这只影响显示口径，不改变任何统计与存储的数值。'),
   queue: t('只对「排队制」的上游生效：模型繁忙时上游不报错，只回一句「建议 N 秒后再来」，网关按建议时长等一会儿再发同一请求，等满次数仍排不上才把「排队中」作为错误返回（HTTP 503，文案会说明这不是登录态或额度问题）。等待发生在首个字节之前，吃的是「等待响应超时」那份预算 —— 两项设置一起决定一次请求最多卡多久；排队不会标记账号限额、也不会换账号（换谁都一样在排队）。保存后对下一个请求立即生效，不用重启。'),
   captchaPool: t('模型请求是否需要验证码由 ZCode 上游配置决定，领取验证与模型请求免验证分别处理。后台只检查配置和库存，不自动运行验证码或弹出拼图；需要验证时，在账号的「套餐明细」中点击「开始验证」。验证令牌一次性使用，短时间内过期，失败或取消后不会自动重试。'),
-  captchaSides: t('两张开关分别管桌面端（应用内窗口，也包含开启局域网访问后从其他设备访问的那份面板）与网页端（Docker / 服务端自托管的浏览器面板）。默认都开启；桌面端只在本机使用、嫌验证耗时可以关掉，网页端暴露在网络上，建议保持开启。'),
+  captchaSides: t('两组设置分别用于桌面端托管的网页管理面板与网页端（Docker / 服务端）的浏览器面板。是否可被其他设备访问取决于网络访问与防火墙设置，不限于局域网。两端默认都开启人机验证，建议保持开启。'),
   timeouts: t('上游请求四个阶段各自的等待上限（秒，1~3600）：①「连接中超时」= 建立 TCP/TLS 连接或代理隧道的最大等待，默认 30 秒；②「等待响应超时」= 请求发出后等上游响应头的最大时间，默认 300 秒 —— 网关请求上游恒带 stream，响应头在 SSE 建立时就到达，与模型思考多久无关；③「流式响应空闲超时」= 流式响应相邻两块数据之间允许的最大空闲，收到新数据即重新计时，默认 300 秒 —— 上游长时间不吐数据即判定连接僵死并断开；④「非流式响应超时」= 读完整份非流式响应体的总预算（一次性计时、不重置），默认 300 秒。四项都是「等待上限」，只要数据还在来，正常的流式回答就一直往下传。保存后对下一个请求立即生效，不用重启。'),
   retry: t('请求转发到上游失败时（服务器瞬时错误、连接失败，以及 WorkBuddy 的 11-128 敏感词拦截），网关会等一段间隔后再发一次。次数分两档，管的是两件事：①「同一账号重试次数」在同一账号上原地重发几次 —— 一般是提示词被上游拦截、或链路瞬时抖动，等一会儿重发往往就好了；②「切换账号重试次数」这份请求最多再换几个账号试 —— 首发的那个账号不算，每换一个扣一次，不分是不是同一家（换到同一家的下一个账号也算一次），换满还失败就把错误返回给客户端。两项都设为 0 表示失败不重试、直接报错。注意账号级限额（429）不占这里的换号次数 —— 那类失败走「冷却该账号并换下一个账号」的降级，与这里的重试是两条路。另有「指定错误码直接换号」名单（默认 402）：命中名单的上游状态码不在同一账号重发，直接按队列换下一个账号继续试（换号也占「切换账号重试次数」），换满仍失败才把错误返回给客户端。'),
   routing: t('转发一个请求时按什么顺序挑账号：①「路由策略」决定排队规则 —— 顺序优先是排第 1 的接走所有请求、直到它不能答（限流 / 故障 / 额度尽）才轮到下一位；负载均衡是每条请求换下一位，把负载摊到各个账号上。②「会话粘性」让同一会话（相同的模型 + 相同的开头消息）尽量跟住同一个账号 —— 多轮对话的上下文缓存能复用、少换号少浪费；自动档粘 5 分钟、会话内档粘 6 小时、每轮与关闭都不粘。账号的排队位次（账号表的第一列）在所有策略下都是地基，策略在它之上再排。此外路由还有三层自愈保护：转发失败的账号退避休息一会儿（15 分钟起步翻倍、封顶 1 小时）、被 429 的账号垫底排到队尾 30 分钟、余额不足 / Token 周期用量到顶的账号由限制器拦下 —— 前两层可以在下面按需开关，限制器由账号的「限制器」设置管。'),
   sanitize: t('指纹脱敏会在转发前按词表顺序改写请求消息中的文本，包括对话内容、思考内容和工具调用参数。默认词表包含客户端模板句与计费表头的精确替换、正则删除规则，可以新增、编辑、删除、启停和调整顺序；替换内容留空表示删除匹配内容。默认应用全部提供商，也可指定多家。改动只作用于发给上游的副本，响应内容不变。编辑后点击「保存设置」，下一次请求生效；清空词表表示不做任何指纹改写，恢复默认只重置词表。'),
   developerRoleCompat: t('OpenAI 新版 API 用 developer 角色取代 system 承载指令，新版 OpenAI SDK 与部分客户端发的对话里会出现 role 为 developer 的消息；不少 OpenAI 兼容上游（尤其是自定义提供商的透传路径）不认识这个角色，收到就报 400。开启本项后，网关在每次转发前把 developer 角色的消息改写为 system —— 两类角色在 OpenAI 语义上等价（OpenAI 自己的迁移指南也是这么映射的），改写不影响对话内容与语义；对本来就只认 system 的各家内置上游同样无害。默认开启；关掉后 developer 消息会原样发往上游，不认识它的上游会报「角色不存在」一类的错误。'),
+  reasoningCollapse: t('让 Codex 在收到最终答案后收起中间过程。仅为严格识别的 Codex Responses 请求补阶段标记，报表归类和来源声明不影响此判断。正常结束且没有工具调用的非空回答才补 final_answer，工具调用前的说明补 commentary；错误、截断、缺少结束信号或未知结束原因不补最终答案标记。默认关闭，不改变回答文字，也不减少模型思考或用量。'),
   imageCompress: t('对话里内嵌的 base64 大图（截图、照片）既撑大请求体，也拉高按像素折算的上游计费。开启后，网关在转发前把超过阈值的图等比缩到长边上限、重新存成 JPEG —— 只改发给上游的副本，请求日志里保存的仍是你发来的原图。同一张原图在多轮对话里重复出现时复用上一次的压缩结果，不会每轮重算。http 链接图片、GIF 动图、SVG 一律不动；压完反而更大的图也保留原图。只作用在对话场景，生图与图片编辑不受影响。默认开启；不想要的话把开关关掉即可。'),
   clineHeaders: t('Cline 上游按请求头判定「调用方是不是 Cline 自家产品」：X-CLIENT-TYPE: cline-sdk 是硬门槛（缺了它免费池模型一律 403），版本号与平台标识让请求更贴近官方客户端的形态。这里列出的是网关默认会发的头：改某一行的值 = 覆盖默认值（也可以新增默认清单之外的自定义头）；把值清空保存 = 这个头不发送；在界面删掉被改过的行 = 回落默认值。改完点「保存」，下一个 Cline 请求立即生效。不懂某一行的含义就不要动它 —— 伪装头的价值在「与官方客户端逐字一致」。'),
   cors: t('网关面（/v1/*）默认不应答浏览器跨源请求：页面直连会被预检拦下，只报「无法连接 API」。注意来源是 * —— 未配「网关 Key」时任何网页都能借本机网关打上游，故默认关闭；只给自己用的话，让页面与网关同源（本地反代 /v1）更稳妥。面板接口（/api/*）不受影响。'),
-  zcodeVersion: t('ZCode 的活动套餐（限时体验礼包）由上游按**客户端版本号**决定下不下发：探测接口只在版本号达到当期门槛时才返回套餐列表，版本落后时回一份空列表（不是报错，所以界面上看起来像「没有活动」）。2026-10 那期实测：3.16.0 及以下全空，3.16.1 起才有礼包。插件内置的默认值会随活动更新，但上游每期可能再抬高一档 —— 那时如果官方客户端里能看到活动、这里却探测为空，就在这里填官方客户端当前的版本号（形如 3.16.2）。环境变量 ZCODE_APP_VERSION 优先级更高。'),
   prompt: t('客户端（Claude Code / Codex 等 CLI）会在 system 提示词里注入几十句固定模板，上游按逐字匹配审核，命中就整单拦截（HTTP 400）。指纹脱敏能改写实测命中过的那几句，但换一个客户端版本就可能冒出新的。这里可以把 system 整段换成网关自己那份：①「透传」= 不动客户端 system（默认，行为与之前完全一致）；②「替换」= 删掉客户端所有 system / developer 消息，换成网关的提示词（客户端项目规范随之消失）；③「追加」= 在开头连续 system 块之后插入一条网关提示词，既有消息逐字不动（客户端规范与网关提示词并用）。那份提示词有两个来源：提示词文件（留空用内置默认），或直接在界面上编辑正文 —— 编辑过就以那份正文为准（优先于文件），清空则回到文件 / 内置默认。另外，透传 / 追加模式下撞了内容拦截（多半是指纹误报）时，网关会自动换一段最小中性提示词重试一次，并把「降级期」开到次日 00:00 —— 期间所有请求直接带中性提示词出门，不再先撞一次 400；这里能看见并提前解除它。上面几项是**默认值**：想给某个提供商单独配，用下面的「按提供商」加一行（带「网关自带」的家默认就列在那里）—— 不同的上游对这些内容的接受程度不一样。'),
   debug: t('开启后，网关会把每次转发**发给上游的请求**（请求头 + 请求体）与**上游返回的响应**（状态码 + 响应头 + 响应体）完整保存到本地，供请求日志页的「详情」查看。请求头里的 Authorization、Cookie、API Key 等凭据字段一律替换成 [redacted]，不会明文落盘；请求体与响应体按原样保存（可能包含你的对话内容）。报文只保留最近 500 条，超出后丢弃最旧的。这是排障用的临时开关，不需要时建议关闭。'),
   io: t('导出会把全部账号与自定义提供商定义写入一个 JSON 文件，可以拷到另一台机器上导入后继续使用。导入采用合并策略：同提供商下按业务身份（UID / userId / apiKey 等）去重 —— 已存在的账号只更新凭证，保留本机原有的优先级顺序；新账号追加到转发顺序末尾，不会抢占当前正在使用的账号；自定义提供商定义按 id 合并，本机缺失时自动补建。'),
@@ -902,9 +908,9 @@ export const NOTES = {
   retryCodes: t('命中这些上游状态码的失败不在同一账号重发，直接换下一个账号继续试（换号占用「切换账号重试次数」，换满仍失败才把错误原样返回给客户端）。输入 100–599 的状态码后回车添加，点 × 或退格删除；默认 402（积分不足）。清空全部表示任何错误都照常重试。'),
   sanitize: t('默认开启并应用全部提供商。编辑词表或应用范围后点击「保存设置」，下一次请求立即生效，不用重启。命中明细仍记进请求日志的「敏」标签。'),
   developerRoleCompat: t('默认开启。只改 role 字段本身，消息内容与顺序都不动；本项只改发给上游的副本，客户端看到的响应内容不变。'),
+  reasoningCollapse: t('默认关闭。开启后下一次 Codex 请求立即生效，不用重启；只对 Codex 来源的 /v1/responses 请求补阶段标记，其它客户端与 /v1/chat/completions 不受影响。'),
   imageCompress: t('默认开启。只改发给上游的副本，客户端看到的响应与原图都不变；请求日志里保存的是客户端发来的原图，不是压缩后的版本。只作用在对话链路，生图 / 图片编辑不经过这里。改完对下一个请求立即生效，不用重启。'),
   clineHeaders: t('值与默认值相同的行不占覆盖（存的是「改过的键」，不是全量配置）；值留空保存表示这个头不发送，删除改过的行表示回落默认值。改完立即生效，不用重启。'),
-  zcodeVersion: t('留空 = 用插件内置的默认版本号（每期活动由插件跟随官方更新）。只有遇到「官方客户端里能看到活动、这里探测为空」时才需要填：那种情况几乎都是上游抬高了版本门槛，而版本落后的表现是一份空列表而不是报错。按官方客户端当前版本填（形如 3.16.2），保存后回到套餐明细刷新一次即刻生效。环境变量 ZCODE_APP_VERSION 若已设置，优先级高于这里。'),
   cors: t('默认关闭。改动立即生效，不用重启；关闭期间的跨源请求会被预检拦下。'),
   debug: t('开启后，新发生的请求会保存上游调试报文与下游正文，历史请求无法补录。上游调试报文只保留最近 500 条；两侧条数可在「数据 → 数据存储」查看。关闭开关不会删除已保存的报文，可在请求日志中选择「仅清空报文原文」一起清理。'),
   promptMode: t('替换 = 客户端 system / developer 消息全部删掉，换成网关的提示词；追加 = 保留客户端内容，只在开头 system 块之后多插一条。两者都只改发给上游的副本，客户端看到的响应不变。'),
@@ -921,7 +927,7 @@ export const NOTES = {
   captcha: t('开启后，登录页在浏览器后台自动完成验证（对真人无感），而脚本每次尝试都要先算一道题 —— 暴力破解与抢注的成本显著上升。仅影响面板的登录 / 注册，与 API 客户端的 API Key 无关。桌面端与网页端各自独立：桌面端主要服务本机与局域网，网页端（Docker / 服务端）直接暴露在网络上的登录页风险更高，建议保持开启。'),
   panelLogin: t('当前浏览器以管理员身份登录着本面板。「退出登录」会撤销这台设备的登录会话（30 天内的自动续期一并失效），需要重新输入账号密码；其他已登录的设备不受影响。'),
   exportDanger: t('导出文件内含 accessToken / refreshToken / apiKey 等凭证与自定义提供商定义，可直接用于登录。请妥善保管，不要外传或上传到公共位置。'),
-  backupDanger: t('备份包含账号凭证、网关 Key、GitHub 令牌与云同步凭据的恢复密钥，整个文件受备份密码保护。请分开保管文件与密码；忘记密码无法恢复。'),
+  backupDanger: t('备份包含账号凭证、网关 Key 与云同步凭据的恢复密钥，整个文件受备份密码保护。请分开保管文件与密码；忘记密码无法恢复。'),
 } as const
 
 /** 状态行（`.settings-state`）的派生文案：与旧实现的赋值逐字一致 */
@@ -943,14 +949,18 @@ export const STATES = {
   roleCompatUnavailable: t('未能读取开发者角色兼容设置，请稍后重试'),
   roleCompatOn: t('正在归一角色：developer 角色消息转发前改写为 system。'),
   roleCompatOff: t('未开启，developer 角色消息会原样发往上游，不认识该角色的上游会报错（400）。'),
+  reasoningCollapseUnavailable: t('未能读取第三方模型回答完自动折叠过程设置，请稍后重试'),
+  reasoningCollapseOn: t('已开启：为正常完成的 Codex 回答补阶段标记。'),
+  reasoningCollapseOff: t('已关闭：不额外补阶段标记，由客户端决定过程展示。'),
   corsUnavailable: t('未能读取网关跨域访问设置，请稍后重试'),
   corsOn: t('正在应答跨源请求：浏览器跨域请求可直连 /v1/*。'),
   corsOff: t('未开启，浏览器跨域无法直连网关。'),
   modelsDevUnavailable: t('未能读取 models.dev 元数据状态，请稍后重试'),
+  modelsDevRefreshing: t('正在从 models.dev 更新…'),
   /** 数据来历：内嵌快照（发版时那份）/ 上次刷新结果 / 刚拉的 */
-  modelsDevSourceBuiltin: t('随包内嵌的快照（发版时的那份）'),
-  modelsDevSourceCache: t('上次成功刷新的结果（存在本机数据库里）'),
-  modelsDevSourceNetwork: t('刚刚从 models.dev 拉到的最新数据'),
+  modelsDevSourceBuiltin: t('内置快照'),
+  modelsDevSourceCache: t('本地缓存'),
+  modelsDevSourceNetwork: t('在线拉取'),
   modelsDevEmpty: t('还没有装载任何数据。'),
   promptUnavailable: t('未能读取系统提示词设置，请稍后重试'),
   degradeUntilFallback: t('次日 00:00'),

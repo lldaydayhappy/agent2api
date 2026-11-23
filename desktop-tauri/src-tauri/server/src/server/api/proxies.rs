@@ -1,4 +1,4 @@
-//! 代理管理：手动地址 CRUD、Clash Verge 端点同步、启停与连通性测试。
+//! 代理管理：手动地址 CRUD、EasyClash 端点同步、启停与连通性测试。
 //! 写操作返回最新代理列表，测试失败以 `success:false` 返回 200。
 
 use axum::body::Bytes;
@@ -29,8 +29,18 @@ pub async fn list_proxies(state: &ServerState) -> Response {
     ok_json(json!({
         "accounts": accounts,
         "clash": crate::server::core::proxies::clash_proxy_options(),
-        "note": "支持手动 HTTP / SOCKS5 地址与 Clash Verge 端点；未配置代理时直连",
+        "note": "支持手动 HTTP / SOCKS5 地址与 EasyClash 端点；未配置代理时直连",
     }))
+}
+
+pub async fn system_proxy() -> Response {
+    let mut response = match tokio::task::spawn_blocking(crate::server::core::proxies::system::snapshot).await {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err(message)) => management_error(400, message),
+        Err(_) => management_error(500, "读取系统代理失败"),
+    };
+    response.headers_mut().insert("cache-control", axum::http::HeaderValue::from_static("no-store"));
+    response
 }
 
 pub async fn test_proxy(state: &ServerState, body: &Bytes) -> Response {
@@ -65,10 +75,10 @@ pub async fn test_proxy(state: &ServerState, body: &Bytes) -> Response {
         }
     }
     let result = egress::test_proxy(proxy.as_ref()).await;
-    logging::log("[Accounts]", &format!("代理测试{}: {}",
+    logging::log_with_level("[Accounts]", &format!("代理测试{}: {}",
         proxy.as_ref().map(|proxy| format!("（{}）", proxy.label)).unwrap_or_else(|| "（直连）".to_string()),
         if result.success { format!("✅ 出口 IP {}", result.ip) } else { format!("❌ {}", result.error.clone().unwrap_or_default()) },
-    ));
+    ), if result.success { "info" } else { "error" });
     let mut data = result.to_json();
     data["proxy"] = egress::describe_public(proxy.as_ref());
     ok_json(data)
@@ -133,6 +143,16 @@ pub async fn pool_create(state: &ServerState, body: &Bytes) -> Response {
         Ok(value) => value,
         Err(_) => return management_error(400, "请求内容不是有效 JSON"),
     };
+    if payload.get("items").is_some() {
+        return match proxy_pool::create_batch(&payload) {
+            Ok(report) => {
+                let mut data = pool_payload(state);
+                data["imported"] = report;
+                ok_json(data)
+            }
+            Err(message) => management_error(400, message),
+        };
+    }
     match proxy_pool::create(&payload) {
         Ok(_) => ok_json(pool_payload(state)),
         Err(message) => management_error(400, message),
@@ -161,7 +181,7 @@ pub async fn pool_remove(state: &ServerState, body: &Bytes) -> Response {
     }
     let exists = proxy_pool::list().iter().any(|item| item.get("id").and_then(Value::as_str) == Some(id));
     match proxy_pool::remove(id) {
-        Ok((_, name)) => {
+        Ok(name) => {
             let mut data = pool_payload(state);
             data["removed"] = json!(name);
             ok_json(data)
@@ -183,7 +203,7 @@ pub async fn pool_enable(state: &ServerState, body: &Bytes) -> Response {
         return management_error(400, "缺少 enabled（true / false）");
     };
     match proxy_pool::set_enabled(id, enabled) {
-        Ok((_, change)) => {
+        Ok(change) => {
             let mut data = pool_payload(state);
             data["name"] = json!(change.name);
             data["enabled"] = json!(change.enabled);
@@ -210,9 +230,9 @@ pub async fn pool_test(state: &ServerState, body: &Bytes) -> Response {
         duration_ms: result.duration_ms,
         error: result.error.clone(),
     }).err();
-    logging::log("[Proxies]", &format!("代理测试（{}）: {}", proxy.label,
+    logging::log_with_level("[Proxies]", &format!("代理测试（{}）: {}", proxy.label,
         if result.success { format!("✅ 出口 IP {}", result.ip) } else { format!("❌ {}", result.error.clone().unwrap_or_default()) },
-    ));
+    ), if result.success { "info" } else { "error" });
     let mut data = result.to_json();
     data["proxy"] = egress::describe_public(Some(&proxy));
     if let Some(error) = write_error { data["saveError"] = json!(error); }

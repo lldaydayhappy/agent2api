@@ -14,12 +14,13 @@
 //!   - `cacheTrend24h` 走**明细**：要精确到本地整点，按天的聚合行给不出这种
 //!     精度；也只取近 24 小时的窄列（`sql::select_summary_rows`）。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate};
 use serde_json::{json, Value};
 
-use super::clock::{date_key, hour_floor, hour_key, ms_to_local, now_ms};
+use super::clock::{date_key, now_ms};
+pub(super) use super::cache_report::{cache_trend_24h, SummaryRow};
 use super::record::{AccountAccum, DailyEntry, ModelAccum, ProviderAccum, RequestEntry};
 
 /// 未知 provider 的展示名（`id` 为空串的那一组：旧版本写出的明细、
@@ -35,25 +36,6 @@ pub(super) const UNKNOWN_ACCOUNT_LABEL: &str = "未知账号";
 
 /// 热力图固定返回的天数（与 range 解耦）
 pub(super) const HEATMAP_DAYS: i64 = 365;
-
-/// 报表要读的**明细窄列**（`sql::SUMMARY_COLUMNS` 的结构形态）。
-///
-/// 为什么要有这个独立类型（不复用 `RequestEntry`）：报表对明细的消费只有
-/// 「按整点归桶 + 按模型累计」两件事，用到的字段就是这 6 个。带上完整
-/// `RequestEntry` 意味着读取侧要按 25 列去取行（`route` / `attempt_details`
-/// 都在里面），而这份数据一个字段都用不上 —— 类型窄一分，读取那一侧就没法
-/// 「顺手多取几列」（见 `sql::select_summary_rows` 与 `db::schema` 的 v15 段）。
-#[derive(Clone, Debug)]
-pub(super) struct SummaryRow {
-    pub ts: i64,
-    pub model: String,
-    /// 上游实际发出的模型名（空串 = 一次都没发出去），统计键的回落见
-    /// [`model_stat_key`]
-    pub upstream_model: String,
-    pub total_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub prompt_tokens: i64,
-}
 
 /// 四档缓存命中率窗口：**JSON 键名 + 窗口毫秒**。
 ///
@@ -160,6 +142,8 @@ pub(super) struct RangeTotals {
     pub requests: i64,
     pub successful: i64,
     pub tokens: i64,
+    pub cost_usd: f64,
+    pub unpriced_requests: i64,
     pub active_days: i64,
     pub model_totals: Vec<ModelAccum>,
     pub provider_totals: Vec<ProviderAccum>,
@@ -177,6 +161,8 @@ pub(super) fn range_totals(
         requests: 0,
         successful: 0,
         tokens: 0,
+        cost_usd: 0.0,
+        unpriced_requests: 0,
         active_days: 0,
         model_totals: Vec::new(),
         provider_totals: Vec::new(),
@@ -189,12 +175,21 @@ pub(super) fn range_totals(
         totals.requests += day.requests;
         totals.successful += day.successful;
         totals.tokens += day.tokens;
+        totals.cost_usd += day.cost_usd;
+        totals.unpriced_requests += day.unpriced_requests;
         // activeDays 只数**区间内**有请求的天数（补零的日子不算「活跃」）
         if day.requests > 0 {
             totals.active_days += 1;
         }
         for acc in &day.model_tokens {
-            push_model_accum(&mut totals.model_totals, &acc.model, acc.tokens, acc.requests);
+            push_model_accum(
+                &mut totals.model_totals,
+                &acc.model,
+                acc.tokens,
+                acc.requests,
+                acc.cost_usd,
+                acc.unpriced_requests,
+            );
         }
         for acc in &day.provider_stats {
             push_provider_accum(
@@ -203,6 +198,8 @@ pub(super) fn range_totals(
                 acc.requests,
                 acc.successful,
                 acc.tokens,
+                acc.cost_usd,
+                acc.unpriced_requests,
             );
         }
         for acc in &day.account_stats {
@@ -213,40 +210,32 @@ pub(super) fn range_totals(
                 acc.requests,
                 acc.successful,
                 acc.tokens,
+                acc.cost_usd,
+                acc.unpriced_requests,
             );
         }
     }
 
-    // ── 旧聚合行的余量归属 ──────────────────────────────────────
-    // 升级前写出的聚合行没有 `providerStats` 键（读入后是空表），那些天的请求
-    // 因此没有任何 provider 组覆盖。这里把「未被任何组覆盖的余量」补进空 id 组：
-    //   ① 各 provider 之和恒等于区间总量 —— 报表之间能对账，前端把
-    //      `providers` 与 `overview.requests` 并排显示时不会出现对不上的数；
-    //   ② 旧数据落进「未知」组而不是被静默丢掉 —— 契约要求不得给旧数据
-    //      **猜**值（不许补 workbuddy），但「未知」正是它的真实归属，不是猜。
-    // 先求和再借用 `&mut`：闭包持着不可变借用时不能同时改这张表。
     let covered_requests: i64 = totals.provider_totals.iter().map(|item| item.requests).sum();
     let covered_successful: i64 = totals.provider_totals.iter().map(|item| item.successful).sum();
     let covered_tokens: i64 = totals.provider_totals.iter().map(|item| item.tokens).sum();
-    // `max(0)` 兜住手改文件造成的「拆分比总量还多」；余量全零时这里仍会建出
-    // 一个空组，但 `build_providers` 会把全零的组滤掉（见那边的 `requests > 0
-    // || tokens > 0`），所以不会凭空冒出空的「未知」项
+    let covered_cost: f64 = totals.provider_totals.iter().map(|item| item.cost_usd).sum();
+    let covered_unpriced: i64 = totals.provider_totals.iter().map(|item| item.unpriced_requests).sum();
     push_provider_accum(
         &mut totals.provider_totals,
         "",
         (totals.requests - covered_requests).max(0),
         (totals.successful - covered_successful).max(0),
         (totals.tokens - covered_tokens).max(0),
+        (totals.cost_usd - covered_cost).max(0.0),
+        (totals.unpriced_requests - covered_unpriced).max(0),
     );
 
-    // ── 账号维度同理 ────────────────────────────────────────────
-    // `accountStats` 是本次新增的键，**所有**已有聚合行都没有它，所以这一段
-    // 在这里比 provider 那一段更常命中：升级后第一次打开报表，区间内几乎全部
-    // 请求都会落进「未知账号」组。这是如实反映「那些行没记账号身份」，
-    // 而不是我们丢数据 —— 明细里其实有，但聚合要跨过年份，只能按聚合算。
     let covered_requests: i64 = totals.account_totals.iter().map(|item| item.requests).sum();
     let covered_successful: i64 = totals.account_totals.iter().map(|item| item.successful).sum();
     let covered_tokens: i64 = totals.account_totals.iter().map(|item| item.tokens).sum();
+    let covered_cost: f64 = totals.account_totals.iter().map(|item| item.cost_usd).sum();
+    let covered_unpriced: i64 = totals.account_totals.iter().map(|item| item.unpriced_requests).sum();
     push_account_accum(
         &mut totals.account_totals,
         "",
@@ -254,22 +243,35 @@ pub(super) fn range_totals(
         (totals.requests - covered_requests).max(0),
         (totals.successful - covered_successful).max(0),
         (totals.tokens - covered_tokens).max(0),
+        (totals.cost_usd - covered_cost).max(0.0),
+        (totals.unpriced_requests - covered_unpriced).max(0),
     );
     totals
 }
 
 /// 把一次请求（或一天的累计）并进按模型的累计表。
 /// 线性查找即可：模型数量是个位到十位级，建 HashMap 反而更慢。
-pub(super) fn push_model_accum(list: &mut Vec<ModelAccum>, model: &str, tokens: i64, requests: i64) {
+pub(super) fn push_model_accum(
+    list: &mut Vec<ModelAccum>,
+    model: &str,
+    tokens: i64,
+    requests: i64,
+    cost_usd: f64,
+    unpriced_requests: i64,
+) {
     match list.iter_mut().find(|item| item.model == model) {
         Some(item) => {
             item.tokens += tokens;
             item.requests += requests;
+            item.cost_usd += cost_usd;
+            item.unpriced_requests += unpriced_requests;
         }
         None => list.push(ModelAccum {
             model: model.to_string(),
             requests,
             tokens,
+            cost_usd,
+            unpriced_requests,
         }),
     }
 }
@@ -297,7 +299,7 @@ pub(super) fn push_model_accum(list: &mut Vec<ModelAccum>, model: &str, tokens: 
 ///
 /// ── 为什么接两个 &str 而不是 &RequestEntry ───────────────────
 /// 同一口径现在要服务两种行：完整的 `RequestEntry`（按天重算）与报表的窄行
-/// [`SummaryRow`]（近 24 小时趋势，只读 6 列，见 `sql::select_summary_rows`）。
+/// [`SummaryRow`]（近 24 小时趋势，只读用量与结果窄列）。
 /// 若签名收 `&RequestEntry`，窄行那一侧就只能自己再写一遍 `if upstream 空就
 /// 回落` —— 那正是这个函数要防的「同一口径两处维护」。取字段而不是取整行，
 /// 两种调用方都能直接用。
@@ -339,52 +341,41 @@ pub(super) fn model_breakdown_json(list: &[ModelAccum]) -> Vec<Value> {
                 },
                 "tokens": item.tokens,
                 "requests": item.requests,
+                "costUsd": item.cost_usd,
+                "unpricedRequests": item.unpriced_requests,
             })
         })
         .collect()
 }
 
-/// 把一批（一条或一天的）请求并进按 provider 的累计表。
-///
-/// 与 `push_model_accum` 同一取舍：provider 数量是个位数，线性查找比 HashMap
-/// 更快也更省（不必分配键）。`provider` 为空串时**照常建组**，不丢弃 ——
-/// 旧数据与「转发前失败」的请求都落在这一组里，丢掉它们会让
-/// 「各 provider 之和」对不上区间总量。
 pub(super) fn push_provider_accum(
     list: &mut Vec<ProviderAccum>,
     provider: &str,
     requests: i64,
     successful: i64,
     tokens: i64,
+    cost_usd: f64,
+    unpriced_requests: i64,
 ) {
     match list.iter_mut().find(|item| item.provider == provider) {
         Some(item) => {
             item.requests += requests;
             item.successful += successful;
             item.tokens += tokens;
+            item.cost_usd += cost_usd;
+            item.unpriced_requests += unpriced_requests;
         }
         None => list.push(ProviderAccum {
             provider: provider.to_string(),
             requests,
             successful,
             tokens,
+            cost_usd,
+            unpriced_requests,
         }),
     }
 }
 
-/// 把一批（一条或一天的）请求并进按账号的累计表。
-///
-/// ── 身份只认 account_id ─────────────────────────────────────
-/// 匹配按 `account_id` 走，**名字不参与判等**：账号可以在账号页改名，
-/// 按名字匹配会让同一个账号在改名前后的两条聚合行分家，报表里出现两个半份的
-/// 「同一账号」。名字在这里只承担一件事：**首次建组时留下的展示名快照**。
-/// 后续同一账号的累计里若带了新名字，就更新快照（账号改名后报表跟着显示新名字，
-/// 这也正是账号页的观感），而不是保留旧名。
-///
-/// ── 空 id 的处理 ─────────────────────────────────────────────
-/// 与 `push_provider_accum` 同一取舍：`account_id` 为空串时**照常建组**，不丢弃 ——
-/// 走默认登录态转发的请求、以及旧版本写出的行都落在这一组里，
-/// 丢掉它们会让「各账号之和」对不上区间总量。
 pub(super) fn push_account_accum(
     list: &mut Vec<AccountAccum>,
     account_id: &str,
@@ -392,14 +383,16 @@ pub(super) fn push_account_accum(
     requests: i64,
     successful: i64,
     tokens: i64,
+    cost_usd: f64,
+    unpriced_requests: i64,
 ) {
     match list.iter_mut().find(|item| item.account_id == account_id) {
         Some(item) => {
             item.requests += requests;
             item.successful += successful;
             item.tokens += tokens;
-            // 名字只做「快照刷新」：非空才覆盖，绝不清空已有的名字
-            // （某些请求拿不到名字而另一些拿到了，取有名字的那一份）
+            item.cost_usd += cost_usd;
+            item.unpriced_requests += unpriced_requests;
             if !account_name.is_empty() {
                 item.account_name = account_name.to_string();
             }
@@ -410,6 +403,8 @@ pub(super) fn push_account_accum(
             requests,
             successful,
             tokens,
+            cost_usd,
+            unpriced_requests,
         }),
     }
 }
@@ -470,6 +465,8 @@ pub(super) fn build_providers(totals: &[ProviderAccum]) -> Vec<Value> {
                 "success": item.successful,
                 "failures": (item.requests - item.successful).max(0),
                 "totalTokens": item.tokens,
+                "costUsd": item.cost_usd,
+                "unpricedRequests": item.unpriced_requests,
             })
         })
         .collect()
@@ -521,6 +518,8 @@ pub(super) fn build_models(totals: &[ModelAccum]) -> Vec<Value> {
                 },
                 "requests": item.requests,
                 "totalTokens": item.tokens,
+                "costUsd": item.cost_usd,
+                "unpricedRequests": item.unpriced_requests,
             })
         })
         .collect()
@@ -567,6 +566,8 @@ pub(super) fn build_accounts(totals: &[AccountAccum]) -> Vec<Value> {
                 "success": item.successful,
                 "failures": (item.requests - item.successful).max(0),
                 "totalTokens": item.tokens,
+                "costUsd": item.cost_usd,
+                "unpricedRequests": item.unpriced_requests,
             })
         })
         .collect()
@@ -597,9 +598,35 @@ pub(super) fn build_accounts(totals: &[AccountAccum]) -> Vec<Value> {
 /// 序列化失败理论上不可能（字段全是 i64 / String / Option<String>），但仍然
 /// 不做 unwrap（panic=abort 下会带走整个应用）：退化成一个空对象，
 /// 前端那一行显示空白，比进程消失好。
-pub(super) fn entry_json(entry: &RequestEntry) -> Value {
+pub(super) fn entry_json(
+    entry: &RequestEntry,
+    pricing: &crate::server::core::model_pricing::ModelPricingSettings,
+) -> Value {
     let Ok(mut value) = serde_json::to_value(entry) else {
         return Value::Object(serde_json::Map::new());
+    };
+    let vision_mode = entry.route.pointer("/visionCompatibility/mode").and_then(Value::as_str).unwrap_or("");
+    let failed = !(200..300).contains(&entry.status) || entry.error.as_deref().is_some_and(|e| !e.is_empty());
+    let cost_calc = if entry.status == 0 || (failed && vision_mode != "assist_call") {
+        None
+    } else {
+        crate::server::core::model_pricing::calc::calc_request_cost_detail(
+            pricing,
+            &entry.provider,
+            &entry.model,
+            &entry.upstream_model,
+            entry.ts,
+            entry.prompt_tokens,
+            entry.completion_tokens,
+            entry.cache_read_tokens,
+            entry.cache_creation_tokens,
+            entry.cache_creation_1h_tokens,
+        )
+    };
+    let (cost_usd, priced, price_source) = match cost_calc {
+        None => (None, false, None),
+        Some(None) => (entry.cost_usd, entry.cost_usd.is_some(), None),
+        Some(Some(detail)) => (Some(detail.cost_usd), true, Some(detail.source)),
     };
     if let Some(object) = value.as_object_mut() {
         object.insert("clientLabel".into(), json!(crate::server::core::client::display_name(
@@ -616,8 +643,93 @@ pub(super) fn entry_json(entry: &RequestEntry) -> Value {
                 None => Value::Null,
             },
         );
+        object.insert("costUsd".to_string(), json!(cost_usd));
+        object.insert("costPriced".to_string(), Value::Bool(priced));
+        object.insert("priceSource".to_string(), json!(price_source));
     }
     value
+}
+
+/// 列表页轻量行转 JSON，契约与 `entry_json` 展示列一致，但省掉大字段拆装。
+pub(super) fn list_entry_json(
+    row: &super::record::RequestListRow,
+    pricing: &crate::server::core::model_pricing::ModelPricingSettings,
+) -> Value {
+    let phase_elapsed = row.phase_started_at.map(|started| (now_ms() - started).max(0));
+    let failed = !(200..300).contains(&row.status) || row.error.as_deref().is_some_and(|e| !e.is_empty());
+    let cost_calc = if row.status == 0 || (failed && row.vision_mode != "assist_call") {
+        None
+    } else {
+        crate::server::core::model_pricing::calc::calc_request_cost_detail(
+            pricing,
+            &row.provider,
+            &row.model,
+            &row.upstream_model,
+            row.ts,
+            row.prompt_tokens,
+            row.completion_tokens,
+            row.cache_read_tokens,
+            row.cache_creation_tokens,
+            row.cache_creation_1h_tokens,
+        )
+    };
+    let (cost_usd, priced, price_source) = match cost_calc {
+        None => (None, false, None),
+        Some(None) => (row.cost_usd, row.cost_usd.is_some(), None),
+        Some(Some(detail)) => (Some(detail.cost_usd), true, Some(detail.source)),
+    };
+    let mut object = serde_json::Map::with_capacity(44);
+    object.insert("rowId".into(), json!(row.row_id));
+    object.insert("id".into(), json!(row.id));
+    object.insert("ts".into(), json!(row.ts));
+    object.insert("model".into(), json!(row.model));
+    object.insert("accountId".into(), json!(row.account_id));
+    object.insert("accountName".into(), json!(row.account_name));
+    object.insert("status".into(), json!(row.status));
+    object.insert("durationMs".into(), json!(row.duration_ms));
+    object.insert("firstResponseMs".into(), json!(row.first_response_ms));
+    object.insert("attempts".into(), json!(row.attempts));
+    object.insert("error".into(), json!(row.error));
+    object.insert("promptTokens".into(), json!(row.prompt_tokens));
+    object.insert("completionTokens".into(), json!(row.completion_tokens));
+    object.insert("totalTokens".into(), json!(row.total_tokens));
+    object.insert("cacheReadTokens".into(), json!(row.cache_read_tokens));
+    object.insert("cacheCreationTokens".into(), json!(row.cache_creation_tokens));
+    object.insert("cacheCreation1hTokens".into(), json!(row.cache_creation_1h_tokens));
+    object.insert("credit".into(), json!(row.credit));
+    object.insert("costUsd".into(), json!(cost_usd));
+    object.insert("costPriced".into(), Value::Bool(priced));
+    object.insert("priceSource".into(), json!(price_source));
+    object.insert("provider".into(), json!(row.provider));
+    object.insert("providerLabel".into(), Value::String(provider_label(&row.provider)));
+    object.insert("clientModel".into(), json!(row.client_model));
+    object.insert("upstreamModel".into(), json!(row.upstream_model));
+    object.insert("clientReasoning".into(), json!(row.client_reasoning));
+    object.insert("upstreamReasoning".into(), json!(row.upstream_reasoning));
+    object.insert("phase".into(), json!(row.phase));
+    object.insert("phaseStartedAt".into(), json!(row.phase_started_at));
+    object.insert("phaseElapsedMs".into(), json!(phase_elapsed));
+    object.insert("isTest".into(), json!(row.is_test));
+    object.insert("client".into(), json!(row.client));
+    object.insert("clientLabel".into(), json!(crate::server::core::client::display_name(&row.client, &row.recorded_client_name)));
+    object.insert("apiKeyId".into(), json!(row.api_key_id));
+    object.insert("apiKeyName".into(), json!(row.api_key_name));
+    object.insert("apiKeySource".into(), json!(row.api_key_source));
+    object.insert("detailsLoaded".into(), Value::Bool(false));
+    object.insert("hasRoute".into(), Value::Bool(row.has_route));
+    if !row.vision_mode.is_empty() {
+        object.insert("visionMode".into(), Value::String(row.vision_mode.clone()));
+    }
+    object.insert("hasSensitiveHits".into(), Value::Bool(row.has_sensitive_hits));
+    object.insert("hasProcessFacts".into(), Value::Bool(row.has_process_facts));
+    if row.internal_retries > 0 {
+        object.insert("internalRetries".into(), json!(row.internal_retries));
+    }
+    object.insert("hasClientEvidence".into(), Value::Bool(row.has_client_evidence));
+    if !row.client_user_agent.is_empty() {
+        object.insert("clientUserAgent".into(), Value::String(row.client_user_agent.clone()));
+    }
+    Value::Object(object)
 }
 
 /// 区间级 topModel：按 `tokens` 降序，并列比 `requests`，再并列比名字
@@ -676,14 +788,19 @@ pub(super) fn daily_trend(daily: &BTreeMap<String, DailyEntry>, start: &str, end
         let (tokens, requests) = day.map(|item| (item.tokens, item.requests)).unwrap_or((0, 0));
         let models = day.map(|item| super::source_report::all_model_rows(&item.model_tokens)).unwrap_or_default();
         let (clients, api_keys) = day.map(super::source_report::source_breakdown).unwrap_or_default();
-        out.push(json!({
-            "date": key,
-            "tokens": tokens,
-            "requests": requests,
-            "models": models,
-            "clients": clients,
-            "apiKeys": api_keys,
-        }));
+        let mut point = day.map(|item| super::source_report::usage_json(&super::source_report::day_usage(item)))
+            .unwrap_or_else(|| super::source_report::usage_json(&super::source::UsageAccum::default()));
+        if let Some(object) = point.as_object_mut() {
+            object.extend(json!({
+                "date": key,
+                "tokens": tokens,
+                "requests": requests,
+                "models": models,
+                "clients": clients,
+                "apiKeys": api_keys,
+            }).as_object().cloned().unwrap_or_default());
+        }
+        out.push(point);
         cursor += ChronoDuration::days(1);
     }
     out
@@ -746,74 +863,6 @@ pub(super) fn cache_rates(totals: &[(i64, i64)]) -> Value {
         );
     }
     Value::Object(out)
-}
-
-/// 近 24 个**本地整点**的命中率与用量趋势（无数据的整点补零）。
-///
-/// 按本地时区切整点：先把时间戳还原成 `DateTime<Local>` 再取 `%H`，
-/// 于是「14 点」就是用户时钟上的 14 点，不是 UTC 的 14 点。
-///
-/// 每个整点同时给出 `totalTokens`：前端那一张图要画**两条线**
-/// （命中率 + 总 Token），两段数据必须同源同桶 —— 分成两次请求会让两条线
-/// 在「这一小时算不算」上出现分歧，看起来像其中一条错位了一格。
-///
-/// 每个整点还带 `models`（`[{model, label, tokens, requests}]`，按 tokens 降序）：
-/// 折线图的悬停读数要给出「这一小时总用量是多少、分别花在哪些模型上」。
-/// 模型统计键走 [`model_stat_key`]（与日报折算同一口径），于是同一小时里
-/// 「各模型之和」必然等于该小时的 `totalTokens`（当份数据之内）。
-///
-/// 入参是**报表窄行**（[`SummaryRow`]，只 6 列）而不是完整明细：本函数是改造后
-/// 唯一还要逐条读明细的地方，而它需要的字段全在窄行的列集里（见
-/// `sql::select_summary_rows`）。窗口外（`ts` 早于 23 个整点前）的行照旧跳过 ——
-/// 调用方给的可能是整个 `request_stats::SUMMARY_WINDOW_MS` 窗口，两者在边界上
-/// 不完全重合（本地时区的整点切法与「now 往前推 N 小时」差几十分钟）。
-pub(super) fn cache_trend_24h(entries: &[SummaryRow], now: i64) -> Vec<Value> {
-    /// 单个整点的桶：三项总量 + 按模型的累计（模型数是个位到十位级，
-    /// 线性查找即可 —— 与 `push_model_accum` 同一取舍）
-    #[derive(Default)]
-    struct HourBucket {
-        hit: i64,
-        input: i64,
-        total: i64,
-        models: Vec<ModelAccum>,
-    }
-
-    let start = hour_floor(ms_to_local(now)) - ChronoDuration::hours(23);
-    let start_ms = start.timestamp_millis();
-
-    // 先把窗口内的条目按整点键归桶，再按 24 个整点取值 ——
-    // 逐个整点扫一遍明细是 24×N，这样只需一次遍历
-    let mut buckets: HashMap<String, HourBucket> = HashMap::new();
-    for item in entries {
-        if item.ts < start_ms || item.ts > now {
-            continue;
-        }
-        let slot = buckets.entry(hour_key(ms_to_local(item.ts))).or_default();
-        slot.hit += item.cache_read_tokens;
-        slot.input += item.prompt_tokens;
-        slot.total += item.total_tokens;
-        push_model_accum(
-            &mut slot.models,
-            model_stat_key(&item.model, &item.upstream_model),
-            item.total_tokens,
-            1,
-        );
-    }
-
-    let mut out = Vec::with_capacity(24);
-    for step in 0..24 {
-        let key = hour_key(start + ChronoDuration::hours(step));
-        let slot = buckets.remove(&key).unwrap_or_default();
-        out.push(json!({
-            "hour": key,
-            "hitTokens": slot.hit,
-            "inputTokens": slot.input,
-            "totalTokens": slot.total,
-            "rate": safe_rate(slot.hit, slot.input),
-            "models": model_breakdown_json(&slot.models),
-        }));
-    }
-    out
 }
 
 /// 命中率：`hit / input`，分母为 0（或无命中）时返回 0.0。

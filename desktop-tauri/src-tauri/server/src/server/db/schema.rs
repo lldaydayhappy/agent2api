@@ -62,6 +62,10 @@
 
 use rusqlite::Connection;
 
+#[cfg(test)]
+#[path = "schema_tests.rs"]
+mod tests;
+
 /// `kv` 表里**不属于网关配置**的固定键名（模块头「两类键名绝不能相撞」讲的
 /// 就是它与配置顶层键的关系）。
 ///
@@ -83,19 +87,29 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 「Agent」页的用户配置：{ clientId: [Profile] } 整份 JSON 一个键
     // （core::agents）。零散状态，与 desktopSettings 同一类。
     "agentProfiles",
+    // 本机编程会话连接设置与加密凭据，不参与配置同步。
+    "assistantCoding",
+    "assistantCodexLocal",
+    "routingProviderCooldowns",
     "priorityScope",
+    // 单账号可信版本的本机库代次；仅新内核使用，不从配置或云同步恢复授权。
+    "accountCredentialEpoch",
     // 侧边栏布局（core::sidebar_layout）：整份「分组 / 顺序 / 显隐」JSON 一个键。
     // 从前只存浏览器 localStorage，而桌面壳与网页端是两个 origin、localStorage
     // 隔离 —— 于是「在 WebUI 里隐藏的菜单，客户端照旧显示」。落库后两端读同一份。
     // 属于「其它零散状态」：配置写入绝不能动它（否则用户改一次 API Key
     // 侧边栏就退回默认布局）。
     "sidebarLayout",
+    // 品牌图片与名称独立保存，避免每次转发克隆整份图片；整库备份仍会保留。
+    "panelBranding",
+    "advertisementCache",
     // 事件日志的下一个 id 水位（logs_store::sql）
     "logsNextId",
     // 整份桌面设置 JSON（壳侧 settings）—— 一个键而不是拆成三个：
     // 桌面设置是整体读写单元（前端一次 PUT 整份），拆键会让一次写入变成
     // 多行更新，徒增事务与冲突面。
     "desktopSettings",
+    "pluginDesktopClients",
     // **遗留**：旧「敏感词脱敏」的整份状态（词表 / 开关 / 作用角色 / 作用提供商）。
     //
     // 那个功能已随规则集换成硬编码指纹脱敏（`core::sanitize`）而整体删除，
@@ -180,6 +194,10 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 与上面的 `modelCatalogCache` 是两码事：那个存各家上游的**模型清单**，
     // 这个存模型的**元数据**（能力位 / 思考档位），刷新链路与失效语义各不同。
     "modelsDevCatalog",
+    // 模型计价模块本地缓存（USD→CNY 汇率、models.dev 完整价格索引、历史费用回填标记），不进云同步。
+    "fxRateCache",
+    "modelsDevProviderPrices",
+    "modelPricingBackfilled",
     // 云同步的配置与同步状态（core::cloud_sync）：整份
     // `{provider, webdav:{…}, s3:{…}, syncPassword(信封), enabled, autoSync,
     //   remoteRoot, profile, status:{lastSyncAt, lastSnapshotId, …}}` 一个键。
@@ -190,6 +208,9 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 换机时还会被旧凭据覆盖。保留键的身份让 `cloud_sync::snapshot` 的键筛选
     // 天然排除它，不必再维护一份「别同步这个键」的清单。
     "cloudSync",
+    // 上游客户端版本号的持久化缓存、同步排期与手动冷却（core::upstream_versions）。
+    // 属于本机同步状态而非配置项；不进云同步，也不能在修改普通配置时被误删。
+    "upstreamVersionCache",
 ];
 
 /// 这个键是否属于「其它零散状态」（即不归网关配置管）。
@@ -338,7 +359,7 @@ pub fn is_reserved(key: &str) -> bool {
 /// 请求日志新增「积分」列读它。与 token 四列刻意不同：这一列**可空 REAL** ——
 /// `NULL` = 这一家没上报（旧行 / 不提供该读数），0 = 确实零消耗；用 0 兜底会
 /// 把「没读到」画成「花了 0 积分」，比缺一列更难排查。
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 32;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -1073,6 +1094,14 @@ fn apply_version(
         // v23：requests 补「积分消耗」一列（请求日志的积分列，见 V23_SCHEMA）
         23 => conn.execute_batch(V23_SCHEMA),
         24 => conn.execute_batch(include_str!("schema_client_identification.sql")),
+        25 => conn.execute_batch(include_str!("schema_tool_images.sql")),
+        26 => conn.execute_batch(include_str!("schema_maintenance.sql")),
+        27 => conn.execute_batch(include_str!("schema_coding.sql")),
+        28 => conn.execute_batch(include_str!("schema_model_recency.sql")),
+        29 => conn.execute_batch(include_str!("schema_usage_query.sql")),
+        30 => conn.execute_batch(include_str!("schema_usage_diagnostics.sql")),
+        31 => conn.execute_batch(include_str!("schema_checkin_records_index.sql")),
+        32 => conn.execute_batch(include_str!("schema_model_pricing.sql")),
         _ => Ok(()),
     }
 }

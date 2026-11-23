@@ -26,6 +26,7 @@ use crate::server::core::account_store::store_util::{js_truthy, max_concurrent_p
 use crate::server::core::custom_providers;
 use crate::server::core::endpoints::{resolve_edition, EditionInfo};
 use crate::server::core::proxies::describe_account_proxy;
+use super::usage_settings::usage_query_public;
 
 /// 这条账号所属的家，此刻是否出现在管理界面上。
 ///
@@ -35,6 +36,13 @@ use crate::server::core::proxies::describe_account_proxy;
 pub(crate) fn account_visible(provider: &str) -> bool {
     provider.starts_with(custom_providers::ID_PREFIX)
         || crate::server::core::providers::is_executable_provider(provider)
+}
+
+pub(crate) fn account_list_visible(provider: &str, booting: bool) -> bool {
+    account_visible(provider)
+        && (provider.starts_with(custom_providers::ID_PREFIX)
+            || crate::server::core::providers::subscriptions::contains(provider)
+            || !booting)
 }
 
 /// 快照的两种用途：内部逻辑要全部账号，界面只要此刻能用的。
@@ -156,6 +164,7 @@ impl AccountStore {
         // Node 是 `record.rateLimits || {}`：任何真值都原样透出
         // （手工写成数组/字符串时也照透，前端按对象读会得到 undefined，
         // 与 Node 的行为保持一致比「顺手修正」重要）
+        public.insert("routingCooldowns".to_string(), value_or(fields.get("routingCooldowns"), json!({})));
         public.insert(
             "rateLimits".to_string(),
             value_or(fields.get("rateLimits"), Value::Object(Map::new())),
@@ -298,8 +307,9 @@ impl AccountStore {
         // 「隐藏」恒为空，算它只是白跑一遍。
         let mut hidden: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
+        let booting = crate::server::core::plugin_host::startup::booting();
         for record in &state.accounts {
-            if visibility == Visibility::All || account_visible(record.provider().as_str()) {
+            if visibility == Visibility::All || account_list_visible(record.provider().as_str(), booting) {
                 visible.push(record.clone());
             } else {
                 *hidden.entry(record.provider()).or_insert(0) += 1;
@@ -484,12 +494,20 @@ impl AccountStore {
         };
         match shaped {
             Value::Object(mut fields) => {
-                for key in ["upstreamCooldownUntil", "upstreamBlockedReason"] {
+                for key in ["rateLimits", "routingCooldowns", "upstreamCooldownUntil", "upstreamBlockedReason"] {
                     if let Some(value) = record.get(key) { fields.insert(key.to_string(), value.clone()); }
                     else { fields.remove(key); }
                 }
                 if !record.has_plugin_secret() {
                     super::plugin_public::credential_fields(record, &mut fields);
+                }
+                if let Some(catalog) = record.get("pluginState").and_then(|state| state.get("host.catalog.v1")) {
+                    fields.insert("pluginModelPermissions".into(), json!({
+                        "known": catalog["value"]["meta"]["remote"] == true,
+                        "refreshedAt": catalog["value"]["meta"]["refreshed_at"],
+                        "models": catalog["value"]["models"].as_array().into_iter().flatten()
+                            .filter_map(|model| model["id"].as_str()).collect::<Vec<_>>(),
+                    }));
                 }
                 fields.insert(
                     "hasCredentials".to_string(),
@@ -558,8 +576,8 @@ impl AccountStore {
                 }
                 fields.insert("checkinAt".to_string(), Value::from(record.checkin_at()));
                 fields.insert("checkedInToday".to_string(), Value::Bool(super::checkin_state::completed(record)));
-                fields.insert("dailyCheckin".to_string(), super::checkin_state::record_status(record)
-                    .cloned().unwrap_or(Value::Null));
+                fields.insert("dailyCheckin".to_string(), super::checkin_state::doubao_status(record)
+                    .or_else(|| super::checkin_state::record_status(record).cloned()).unwrap_or(Value::Null));
                 // 成长中心连登天数（WorkBuddy 国内版；签到后回读落库，见
                 // `AccountStore::mark_streak_days`）。恒为数字键（0 = 还没读到过），
                 // 与 checkinAt 同一理由：界面按数字读，不必判「字段缺失」。
@@ -580,8 +598,8 @@ impl AccountStore {
                 // 是**同一份事实**。恒为数字键（0 = 不限），且**只在这里写一次**：
                 // 从前它是各家公开形态里各自的 `insert`，于是逐字段白名单那几家
                 // （monkeycode / antigravity / officeace）漏了它 —— 缺键被选路当成
-                // 0 = 不限，上限**静默失效**。CodeArts 的「0 = 按本家默认并发」口径
-                // 由 `max_concurrent_public_for` 一处承载，别家 0 就是不限。
+                // 0 = 不限，上限**静默失效**。CodeArts 与脚本插件的默认并发
+                // 由 `max_concurrent_public_for` 一处承载，未声明默认值的提供商仍为不限。
                 fields.insert(
                     "maxConcurrent".to_string(),
                     Value::from(max_concurrent_public_for(
@@ -612,9 +630,22 @@ impl AccountStore {
                 // 弹窗、徽章读的是**同一份事实**，不能各家形状一个口径。
                 // 恒为对象（未配置 = 各家缺省档的规范化形状，与写入侧
                 // `apply_patch` 的归一化一致），读侧不必判「键缺失」。
+                fields.insert("usageConfigKey".to_string(), Value::String(crate::server::core::usage_query::config::reading_key(record)));
                 fields.insert(
                     "usageQuery".to_string(),
                     usage_query_public(record.fields().get("usageQuery")),
+                );
+                // 公开当前有效的账号覆盖值；被固定身份策略禁止的旧值不交给执行体。
+                fields.insert(
+                    "userAgent".to_string(),
+                    Value::String(crate::server::core::user_agent::override_value(
+                        &record.provider(),
+                        record.get("userAgent").and_then(Value::as_str).unwrap_or(""),
+                    ).to_string()),
+                );
+                fields.insert(
+                    "userAgentOverridable".to_string(),
+                    Value::Bool(crate::server::core::user_agent::provider_overridable(&record.provider())),
                 );
                 fields.insert(
                     "lowBalance".to_string(),
@@ -657,6 +688,7 @@ impl AccountStore {
                         Value::Bool(super::chatglm_accounts::guest_of_record(record)),
                     );
                 }
+                super::credential_version::strip_private(&mut fields);
                 Value::Object(fields)
             }
             // 各家形状恒为对象；真出现异常形态时原样透出，不在这里改语义
@@ -820,33 +852,6 @@ fn balance_query_public(fields: &Map<String, Value>, scheme: &str) -> Value {
         "hasPassword": configured("password"),
         "hasToken": configured("token"),
     })
-}
-
-/// 记录上的 `usageQuery` → 公开形态的规范化形状（恒为对象）。
-///
-/// 读侧只做**容错展开**、不校验：合法性由写入侧（`apply_patch` 的
-/// `normalize_usage_query`）保证，这里负责把缺失 / 脏值收敛成缺省形状，让
-/// 调度与前端都按「恒定形状」读。缺省与 `usage_records::query_interval_of`
-/// 同一口径 —— **未配置 = 开启、1 分钟**（对齐全局任务时代「默认就在查」的
-/// 行为，升级后余额列不停更），只有显式 `{enabled:false}` 才是关。
-fn usage_query_public(value: Option<&Value>) -> Value {
-    use crate::server::core::usage_records::{
-        DEFAULT_QUERY_INTERVAL_SECONDS, MAX_QUERY_INTERVAL_SECONDS, MIN_QUERY_INTERVAL_SECONDS,
-    };
-    let Some(fields) = value.and_then(Value::as_object) else {
-        return json!({ "enabled": true, "interval": DEFAULT_QUERY_INTERVAL_SECONDS });
-    };
-    let enabled = fields.get("enabled").map(js_truthy).unwrap_or(true);
-    let interval = fields.get("interval").and_then(Value::as_i64).unwrap_or(0);
-    // 开着但间隔缺失 / 越界（脏值）→ 缺省间隔；关着则原样透出（0 = 未设过）
-    let interval = if enabled
-        && !(MIN_QUERY_INTERVAL_SECONDS..=MAX_QUERY_INTERVAL_SECONDS).contains(&interval)
-    {
-        DEFAULT_QUERY_INTERVAL_SECONDS
-    } else {
-        interval
-    };
-    json!({ "enabled": enabled, "interval": interval })
 }
 
 /// 记录上的 `lowBalance` → 公开形态的规范化形状。

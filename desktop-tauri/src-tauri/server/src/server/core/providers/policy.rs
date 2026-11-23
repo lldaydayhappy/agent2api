@@ -7,6 +7,7 @@ use serde::Deserialize;
 pub struct ChatPolicy {
     pub repair_native_tools: bool,
     pub stable_conversation: bool,
+    pub respect_model_cooldown: bool,
     pub network: Option<NetworkPolicy>,
 }
 
@@ -33,6 +34,8 @@ pub struct HttpDnsPolicy {
 #[serde(default, rename_all = "camelCase")]
 pub struct ErrorPolicy {
     pub stop: bool,
+    #[serde(skip)]
+    pub stop_switching: bool,
     pub account_cooldown_until: Option<i64>,
     pub suspend_account: bool,
     pub reason: String,

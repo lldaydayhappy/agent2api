@@ -1,3 +1,6 @@
+import { confirmDialog } from '@ui'
+import { invalidateUsageTasks } from './accounts-usage-tasks'
+import { ensureAccountDetails, ensureAccountsDetails, pruneAccountDetails } from './accounts-list-api'
 import {
   errorMessage, POOL_VALUE_PREFIX, shared, toast,
   type AccountRecord,
@@ -39,7 +42,14 @@ export {
 
 export function openSettingsDialog(id: string): void {
   if (!findAccount(id)) { toast(t('账号不存在，请刷新后重试'), 'err'); return }
-  patch({ dialog: { kind: 'settings', id } })
+  const loading = { kind: 'settings-loading' as const, id }
+  patch({ dialog: loading })
+  void ensureAccountDetails(id).then(() => {
+    if (getStore().dialog === loading) patch({ dialog: { kind: 'settings', id } })
+  }).catch(error => {
+    if (getStore().dialog === loading) patch({ dialog: null })
+    toast(t('读取账号详情失败：{message}', { message: errorMessage(error) }), 'err')
+  })
 }
 
 export function closeDialog(): void {
@@ -49,7 +59,14 @@ export function closeDialog(): void {
 export function openBatchDialog(ids: string[], action = 'enable'): void {
   const selected = (Array.isArray(ids) ? ids : []).filter(id => findAccount(id))
   if (!selected.length) { toast(t('请先勾选要操作的账号'), 'err'); return }
-  patch({ dialog: { kind: 'batch', ids: selected, action } })
+  const loading = { kind: 'batch-loading' as const, ids: selected, action }
+  patch({ dialog: loading })
+  void ensureAccountsDetails(selected).then(() => {
+    if (getStore().dialog === loading) patch({ dialog: { kind: 'batch', ids: selected, action } })
+  }).catch(error => {
+    if (getStore().dialog === loading) patch({ dialog: null })
+    toast(t('读取账号详情失败：{message}', { message: errorMessage(error) }), 'err')
+  })
 }
 
 /**
@@ -68,6 +85,7 @@ export function openGroupDialog(provider: string): void {
 
 /** 清掉已删除账号的本地缓存（app.js 每次 refresh 后调用） */
 export function refreshCaches(validIds: Set<string>): void {
+  pruneAccountDetails(validIds)
   let touched = pruneUsageCache(validIds)
   const connections = new Map(getStore().connections)
   for (const id of [...connections.keys()]) if (!validIds.has(id)) { connections.delete(id); touched = true }
@@ -78,33 +96,13 @@ export function refreshCaches(validIds: Set<string>): void {
   if (touched) patch({ connections, usageInflight: inflight, selected })
 }
 
-/* ─── 连接数（实时，2 秒一轮）────────────────────
- * 口径与 OmniProxy 上游管理页的「连接」列一致：**此刻正在使用这个账号的请求数**
- * （一个请求在账号间轮换时计数跟着走，见后端 core::upstream::connections）。
- * 单独一条 2 秒轮询而不是跟着 app.js 那 20 秒一轮：连接数的全部意义就在「现在」。
- * 后端那边是进程内计数（不读盘、不出网），所以这条链路的代价足够低。 */
-
-/** 2 秒：够快看得出「正在跑」，又不至于让 DevTools 的网络面板刷屏 */
-export const CONNECTIONS_POLL_MS = 2000
+/* ─── 连接数 ───────────────────────────────── */
 
 export function connectionsOf(id: string): number {
   return getStore().connections.get(id) || 0
 }
 
-/**
- * 拉一次连接数。失败静默：2 秒一次的轮询，后端不可达时 toast 会变成刷屏；
- * 且缓存保留上一轮的值比清空更贴近事实（用户看到的是「刚才还在跑」）。
- *
- * ── 数值没变就不写 store（本次改造）──────────────────────────
- * 这条链路每 2 秒跑一次，而「有请求在跑」是少数时刻：绝大多数轮次里
- * `connections` 都是同一份空表。原实现照写不误，而 store 的每次 `patch` 都会换一份
- * 新快照（`useSyncExternalStore` 按引用判「变了没」）—— 于是账号页每 2 秒整体重渲染
- * 一次，43 个账号 × 十几列的单元格全部重建，屏幕上却一个数字都没变。这里先比一遍，
- * 相同就直接返回：那 2 秒一次的「重渲染整页」在空闲时彻底消失。
- *
- * 比较口径与写入口径必须一致（都是「只放 count > 0 的项」）—— 两个 Map 的构造
- * 走的是同一段代码，所以「key 集合 + 每个值」全等都等价于「这份读数与上一份相同」。
- */
+/** 数值不变时不通知页面，读取失败时保留上一份连接数。 */
 export async function syncConnections(): Promise<boolean> {
   try {
     const data = await shared().workbuddyDesktop?.getAccountConnections?.()
@@ -133,19 +131,6 @@ function sameConnections(
     if (prev.get(id) !== count) return false
   }
   return true
-}
-
-/**
- * 起轮询定时器（只起一次）。只在**账号页可见**时真发请求：切到别的页、或窗口被
- * 最小化时不打后端 —— 与 requests-page / logs-panel 的轮询同一取舍。
- */
-let connectionsTimer: ReturnType<typeof setInterval> | null = null
-export function startConnectionsPolling(): void {
-  if (connectionsTimer) return
-  connectionsTimer = setInterval(() => {
-    if (document.hidden || shared().wbApp?.currentPage !== 'accounts') return
-    void syncConnections()
-  }, CONNECTIONS_POLL_MS)
 }
 
 /* ─── 行内动作（启用 / 顺序 / 限流 / 代理）─────
@@ -230,7 +215,9 @@ export async function setGroupEnabled(ids: string[], enabled: boolean): Promise<
 /** 清除限流标记：单条（model）或全部。后端返回新快照，交给全局刷新对齐。 */
 export async function clearLimits(id: string, model?: string): Promise<void> {
   try {
-    await shared().workbuddyDesktop?.clearRateLimits?.(id, model || null)
+    const includeProvider = !model && Number(findAccount(id)?.providerCooldown?.resetAt) > Date.now()
+    if (includeProvider && !await confirmDialog(t('这条冷却由同一提供商的账号共用。清除后这些账号都会重新参与；上游仍受限时会再次冷却。'), { title: t('清除提供商共享冷却') })) return
+    await shared().workbuddyDesktop?.clearRateLimits?.(id, model || null, includeProvider)
     toast(model ? t('✅ 已清除 {model} 的限流标记', { model }) : t('✅ 已清除该账号全部限流标记'))
     await shared().wbApp?.refresh?.()
   } catch (error) {
@@ -252,10 +239,12 @@ export async function clearLimits(id: string, model?: string): Promise<void> {
  * 视图层已经把禁用条目置灰（`disabled`），但下拉的选项来自缓存，极端情况下
  * （缓存刚被别处刷新、弹层已经展开）仍可能点到一条已禁用的。后端
  * `normalize_account_proxy` 有意**不**校验池的当下状态（保存账号不依赖池的
- * 读库结果），所以这里不挡的话会「保存成功 → 解析失败 → 回退直连」，用户只
- * 看到一句「代理已禁用」。挡在这里，提示与视图上的置灰是同一个事实。
+ * 读库结果），所以这里不挡的话会保存成功但出网失败。挡在这里，提示与视图上的
+ * 置灰是同一个事实。
  */
-export async function applyProxyPick(id: string, value: string, fallback: string): Promise<void> {
+export async function applyProxyPick(id: string, value: string | null, fallback: string): Promise<void> {
+  // 下拉选项重建时可能产生 null，它不代表用户选择了「直连」。
+  if (typeof value !== 'string') return
   if (value === PROXY_CUSTOM_EDIT) {
     // 动作项：开弹窗（下拉的原值由调用方在渲染层恢复 —— 它是受控的，重绘即回原值）
     openSettingsDialog(id)
@@ -264,8 +253,11 @@ export async function applyProxyPick(id: string, value: string, fallback: string
   // 当前自定义配置的显示项：选它自己不是一次修改
   if (value === PROXY_CUSTOM_CURRENT) return
   if (value === fallback) return
-  if (value.startsWith(POOL_VALUE_PREFIX)) {
-    const poolId = value.slice(POOL_VALUE_PREFIX.length)
+  const poolId = value.startsWith(POOL_VALUE_PREFIX)
+    ? value.slice(POOL_VALUE_PREFIX.length).trim()
+    : ''
+  if (value !== '' && !poolId) return
+  if (poolId) {
     const item = (proxyPoolSnapshot() || []).find(entry => entry.id === poolId)
     if (item && item.enabled === false) {
       toast(t('「{name}」已在「网络代理」页禁用，请先启用它或换一条', {
@@ -275,9 +267,7 @@ export async function applyProxyPick(id: string, value: string, fallback: string
     }
   }
   try {
-    const proxy = value === ''
-      ? null
-      : { source: 'pool', proxyId: value.slice(POOL_VALUE_PREFIX.length) }
+    const proxy = poolId ? { source: 'pool', proxyId: poolId } : null
     await updateAccountConfirmed(id, { proxy })
     toast(`✅ ${t('代理已更新')}`)
   } catch (error) {
@@ -333,8 +323,12 @@ export function rowContext(
 
 export type AccountsViewApi = {
   render(): void
+  findAccount: typeof findAccount
+  refreshFailureMessage: typeof errorMessage
+  ensureAccountDetails: typeof ensureAccountDetails
   refreshList: typeof refreshList
   refreshCaches(validIds: Set<string>): void
+  invalidateUsageTasks(ids: string[]): void
   syncConnections(): Promise<boolean>
   /**
    * 强制重读「网络代理」页的代理池（切回本页时调）。
@@ -454,8 +448,12 @@ export function installAccountsApi(): void {
   installListRefresh()
   window.wbAccountsView = {
     render: () => { syncAccountSorting(); bump() },
+    findAccount,
+    refreshFailureMessage: errorMessage,
+    ensureAccountDetails,
     refreshList,
     refreshCaches,
+    invalidateUsageTasks,
     syncConnections,
     refreshProxyPool,
     applyBalances,

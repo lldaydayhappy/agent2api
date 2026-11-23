@@ -8,6 +8,10 @@ use crate::server::{db::Db, logging};
 
 use super::types::*;
 
+#[cfg(test)]
+#[path = "counter_tests.rs"]
+mod tests;
+
 static DB: OnceLock<Option<Db>> = OnceLock::new();
 
 #[derive(Clone, Debug, Default)]
@@ -105,6 +109,18 @@ pub fn facts() -> Facts {
     let now = logging::now_ms();
     for count in facts.values_mut() { count.advance(now); }
     facts.clone()
+}
+
+pub(crate) fn next_change(now: i64) -> Option<i64> {
+    let facts = slot().lock().ok()?;
+    facts.values().flat_map(|count| {
+        if count.window.reset == Reset::Rolling {
+            count.events.iter().map(|event| event.ts.saturating_add(count.window.seconds.saturating_mul(1000)).saturating_add(1))
+                .filter(|at| *at > now).min()
+        } else {
+            (count.end > now).then_some(count.end)
+        }
+    }).min()
 }
 
 pub fn invalidate() { if let Ok(mut facts) = slot().lock() { facts.clear(); } }
@@ -229,20 +245,46 @@ fn refresh_inner(accounts: &[serde_json::Value], replace: bool) {
     }
 }
 
-pub fn note(id: &str, request_id: &str, model: &str, channel: &str, tokens: i64, ts: i64) {
-    if id.is_empty() { return; }
-    let Some(db) = DB.get().and_then(Option::as_ref) else { return };
-    // 额度台账独立于请求日志；关联 id 用于收尾幂等，清理日志不回退消耗。
-    let inserted = db.with_mut(|conn| -> rusqlite::Result<Option<i64>> {
-        let changed = conn.execute(
-            "INSERT OR IGNORE INTO account_limiter_events \
-             (id, account_id, model, channel, ts, tokens, requests) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
-            params![if request_id.is_empty() { format!("{id}:{ts}:{model}") } else { request_id.to_string() },
-                id, model, channel, ts, tokens.max(0)]
-        )?;
-        Ok((changed == 1).then(|| conn.last_insert_rowid()))
+pub fn note(id: &str, request_id: &str, model: &str, channel: &str, tokens: i64, ts: i64) -> bool {
+    if id.is_empty() { return false; }
+    let Some(db) = DB.get().and_then(Option::as_ref) else { return false };
+    let inserted = db.with_mut(|conn| {
+        insert_event(conn, id, request_id, model, channel, tokens, ts)
     }).and_then(Result::ok).flatten();
-    let Some(row_id) = inserted else { return };
+    let Some(row_id) = inserted else { return false };
+    update_facts(id, model, channel, tokens, ts, row_id);
+    true
+}
+
+pub(crate) fn insert_event(
+    conn: &rusqlite::Connection,
+    id: &str,
+    request_id: &str,
+    model: &str,
+    channel: &str,
+    tokens: i64,
+    ts: i64,
+) -> rusqlite::Result<Option<i64>> {
+    if id.is_empty() { return Ok(None); }
+    // 额度台账独立于请求日志；关联 id 用于收尾幂等，清理日志不回退消耗。
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO account_limiter_events \
+         (id, account_id, model, channel, ts, tokens, requests) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+        params![if request_id.is_empty() { format!("{id}:{ts}:{model}") } else { request_id.to_string() },
+            id, model, channel, ts, tokens.max(0)]
+    )?;
+    Ok((changed == 1).then(|| conn.last_insert_rowid()))
+}
+
+/// 只能在事务提交且数据库连接锁释放后更新，刷新路径按事实锁、数据库锁的顺序取锁。
+pub(crate) fn update_facts(
+    id: &str,
+    model: &str,
+    channel: &str,
+    tokens: i64,
+    ts: i64,
+    row_id: i64,
+) {
     if let Ok(mut facts) = slot().lock() {
         let now = logging::now_ms();
         for ((account, _), count) in facts.iter_mut() {
@@ -254,4 +296,5 @@ pub fn note(id: &str, request_id: &str, model: &str, channel: &str, tokens: i64,
             count.add(Event { ts, model: model.to_string(), tokens: tokens.max(0), requests: 1 });
         }
     }
+    crate::server::core::panel_events::notify(crate::server::core::panel_events::Change::Usage);
 }

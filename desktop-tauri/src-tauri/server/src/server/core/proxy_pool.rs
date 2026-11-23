@@ -1,8 +1,8 @@
-//! 命名代理池：手动地址与 Clash Verge 端点按 `{source:'pool', proxyId}` 引用。
+//! 命名代理池：手动地址与 EasyClash 端点按 `{source:'pool', proxyId}` 引用。
 //! 条目与最近一次测试结果存于 kv 的 `proxyPool` 保留键。
 //! 旧订阅镜像只保留原始记录，不再列出、解析或参与轮询。
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde_json::{json, Value};
 
@@ -11,18 +11,22 @@ use crate::server::db::Db;
 use crate::server::logging;
 
 pub mod usage;
+mod import;
 
 pub const KV_KEY: &str = "proxyPool";
-pub const RETIRED_HINT: &str = "代理订阅与内置代理内核功能已下线，请在「网络代理」页添加 HTTP / SOCKS5 地址或同步 Clash Verge，并重新选择代理";
+pub const RETIRED_HINT: &str = "代理订阅与内置代理内核功能已下线，请在「网络代理」页添加 HTTP / SOCKS5 地址或同步 EasyClash，并重新选择代理";
 
-const CLASH_READONLY_HINT: &str = "该代理来自 Clash Verge 同步，请到 Clash Verge 中修改名称或端口；本页可启停和测试";
+const CLASH_READONLY_HINT: &str = "该代理来自 EasyClash 同步，请到 EasyClash 中修改名称或端口；本页可启停和测试";
 
 const MAX_NAME_LENGTH: usize = 60;
-const MAX_HOST_LENGTH: usize = 255;
-const MAX_USER_LENGTH: usize = 200;
 const MAX_LABEL_LENGTH: usize = 100;
 
 static DB: OnceLock<Option<Db>> = OnceLock::new();
+static MUTATIONS: Mutex<()> = Mutex::new(());
+
+fn mutation_lock() -> MutexGuard<'static, ()> {
+    MUTATIONS.lock().unwrap_or_else(|error| error.into_inner())
+}
 
 pub fn install(db: Option<Db>) {
     let _ = DB.set(db);
@@ -67,6 +71,7 @@ pub(crate) fn raw_items() -> Vec<Value> {
 }
 
 fn write_items(items: &[Value]) -> Result<(), String> {
+    let _usage_guard = crate::server::core::usage_query::config::lock();
     let db = database()?;
     let text = serde_json::to_string(&json!({ "items": items }))
         .map_err(|error| format!("编码代理池失败: {error}"))?;
@@ -82,6 +87,7 @@ fn write_items(items: &[Value]) -> Result<(), String> {
         })
         .ok_or_else(|| "代理池数据库不可用".to_string())?;
     written?;
+    crate::server::core::panel_events::notify(crate::server::core::panel_events::Change::Proxies);
     crate::server::core::cloud_sync::auto_sync::notify_change();
     Ok(())
 }
@@ -114,7 +120,7 @@ fn normalize_item(input: &Value, existing: Option<&Value>) -> Result<Value, Stri
         return Err("代理条目必须是对象".to_string());
     };
     if is_clash(input) {
-        return Err("Clash Verge 出口由「同步 Clash Verge」自动导入，不能手工新建".to_string());
+        return Err("EasyClash 出口由「同步 EasyClash」自动导入，不能手工新建".to_string());
     }
     if !is_manual(input) {
         return Err(RETIRED_HINT.to_string());
@@ -128,10 +134,10 @@ fn normalize_item(input: &Value, existing: Option<&Value>) -> Result<Value, Stri
     if protocol != "http" && protocol != "socks5" {
         return Err("代理协议只支持 http 或 socks5".to_string());
     }
-    let host = clean_string(object.get("host"), MAX_HOST_LENGTH);
-    if host.is_empty() {
-        return Err("请填写代理主机地址".to_string());
-    }
+    let host = crate::server::core::proxies::normalize_host(object.get("host").and_then(Value::as_str).unwrap_or(""))?;
+    let non_direct = crate::server::core::proxies::normalize_non_direct(
+        object.get("nonDirect").or_else(|| existing.and_then(|item| item.get("nonDirect"))),
+    )?;
     let Some(port) = valid_port(object.get("port")) else {
         return Err("代理端口必须是 1-65535 的整数".to_string());
     };
@@ -155,8 +161,9 @@ fn normalize_item(input: &Value, existing: Option<&Value>) -> Result<Value, Stri
         "protocol": protocol,
         "host": host,
         "port": port,
-        "username": clean_string(object.get("username"), MAX_USER_LENGTH),
-        "password": clean_string(object.get("password"), MAX_USER_LENGTH),
+        "username": crate::server::core::proxies::normalize_credential(object.get("username"))?,
+        "password": crate::server::core::proxies::normalize_credential(object.get("password"))?,
+        "nonDirect": non_direct,
         "createdAt": created_at,
         "updatedAt": now,
         "lastTest": last_test,
@@ -195,6 +202,7 @@ pub fn resolve_item(item: &Value) -> Option<ProxyResolution> {
         "port": item.get("port").cloned().unwrap_or(Value::Null),
         "username": text_of(item, "username"),
         "password": text_of(item, "password"),
+        "nonDirect": item.get("nonDirect").cloned().unwrap_or(Value::Bool(false)),
     })))
 }
 
@@ -258,6 +266,7 @@ fn describe_item(item: &Value) -> Value {
         "port": item.get("port").cloned().unwrap_or(Value::Null),
         "username": text_of(item, "username"),
         "password": text_of(item, "password"),
+        "nonDirect": item.get("nonDirect").and_then(Value::as_bool).unwrap_or(false),
         "createdAt": item.get("createdAt").cloned().unwrap_or(Value::from(0)),
         "updatedAt": item.get("updatedAt").cloned().unwrap_or(Value::from(0)),
         "lastTest": item.get("lastTest").cloned().unwrap_or(Value::Null),
@@ -276,16 +285,22 @@ fn find_raw(id: &str) -> Result<Value, String> {
         .ok_or_else(|| format!("代理「{id}」不存在或已被删除"))
 }
 
-pub fn create(input: &Value) -> Result<Vec<Value>, String> {
+pub fn create_batch(input: &Value) -> Result<Value, String> {
+    import::create(input)
+}
+
+pub fn create(input: &Value) -> Result<(), String> {
+    let _guard = mutation_lock();
     let item = normalize_item(input, None)?;
     let mut items = read_items();
     items.insert(0, item.clone());
     write_items(&items)?;
     logging::log("[Proxies]", &format!("✅ 新增代理「{}」", text_of(&item, "name")));
-    Ok(list())
+    Ok(())
 }
 
-pub fn update(input: &Value) -> Result<Vec<Value>, String> {
+pub fn update(input: &Value) -> Result<(), String> {
+    let _guard = mutation_lock();
     let id = clean_string(input.get("id"), MAX_LABEL_LENGTH);
     if id.is_empty() {
         return Err("缺少代理 id".to_string());
@@ -296,7 +311,7 @@ pub fn update(input: &Value) -> Result<Vec<Value>, String> {
     items[index] = next.clone();
     write_items(&items)?;
     logging::log("[Proxies]", &format!("✅ 更新代理「{}」", text_of(&next, "name")));
-    Ok(list())
+    Ok(())
 }
 
 fn writable_index(items: &[Value], id: &str) -> Result<usize, String> {
@@ -327,13 +342,14 @@ pub struct EnabledChange {
     pub enabled: bool,
 }
 
-pub fn set_enabled(id: &str, enabled: bool) -> Result<(Vec<Value>, EnabledChange), String> {
+pub fn set_enabled(id: &str, enabled: bool) -> Result<EnabledChange, String> {
+    let _guard = mutation_lock();
     let mut items = read_items();
     let index = supported_index(&items, id)?;
     let name = display_name(&items[index], id);
     let clash = is_clash(&items[index]);
     if clash && enabled && matches!(items[index].get("enabled"), Some(Value::Bool(false))) {
-        return Err("这条在 Clash Verge 里是停用的，请到 Clash Verge 里打开它".to_string());
+        return Err("这条在 EasyClash 里是停用的，请到 EasyClash 里打开它".to_string());
     }
     let Some(object) = items[index].as_object_mut() else {
         return Err("代理条目形状异常".to_string());
@@ -350,17 +366,18 @@ pub fn set_enabled(id: &str, enabled: bool) -> Result<(Vec<Value>, EnabledChange
     object.insert("updatedAt".to_string(), Value::from(logging::now_ms()));
     write_items(&items)?;
     logging::log("[Proxies]", &format!("{}代理「{name}」", if enabled { "✅ 启用" } else { "⏸️ 禁用" }));
-    Ok((list(), EnabledChange { name, enabled }))
+    Ok(EnabledChange { name, enabled })
 }
 
-pub fn remove(id: &str) -> Result<(Vec<Value>, String), String> {
+pub fn remove(id: &str) -> Result<String, String> {
+    let _guard = mutation_lock();
     let mut items = read_items();
     let index = writable_index(&items, id)?;
     let removed = items.remove(index);
     write_items(&items)?;
     let name = text_of(&removed, "name");
     logging::log("[Proxies]", &format!("🗑️ 删除代理「{name}」"));
-    Ok((list(), name))
+    Ok(name)
 }
 
 pub struct ClashSyncReport {
@@ -381,13 +398,14 @@ pub fn sync_clash(force: bool) -> ClashSyncReport {
     if snapshot.mixed_port.is_some() {
         targets.push((
             crate::server::core::clash::CLASH_MIXED_UID.to_string(),
-            "Clash 混合端口（按规则分流）".to_string(),
+            crate::server::core::clash::CLASH_MIXED_NAME.to_string(),
             true,
         ));
     }
     for listener in snapshot.listeners {
         targets.push((listener.uid, listener.name, listener.enabled));
     }
+    let _guard = mutation_lock();
     let mut items = read_items();
     let mut changes = 0;
     let now = logging::now_ms();
@@ -430,7 +448,7 @@ pub fn sync_clash(force: bool) -> ClashSyncReport {
         if let Err(error) = write_items(&items) {
             return ClashSyncReport { changes: 0, error: Some(error) };
         }
-        logging::log("[Proxies]", &format!("🔄 已同步 Clash Verge 出口（{changes} 项变更）"));
+        logging::log("[Proxies]", &format!("🔄 已同步 EasyClash 出口（{changes} 项变更）"));
     }
     ClashSyncReport { changes, error: None }
 }
@@ -442,7 +460,8 @@ pub struct TestOutcome {
     pub error: Option<String>,
 }
 
-pub fn record_test(id: &str, result: &TestOutcome) -> Result<Vec<Value>, String> {
+pub fn record_test(id: &str, result: &TestOutcome) -> Result<(), String> {
+    let _guard = mutation_lock();
     let mut items = read_items();
     let index = supported_index(&items, id)?;
     let Some(object) = items[index].as_object_mut() else {
@@ -456,5 +475,5 @@ pub fn record_test(id: &str, result: &TestOutcome) -> Result<Vec<Value>, String>
         "error": result.error,
     }));
     write_items(&items)?;
-    Ok(list())
+    Ok(())
 }

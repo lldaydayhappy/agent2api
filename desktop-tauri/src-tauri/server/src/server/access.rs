@@ -43,6 +43,7 @@ use crate::server::logging;
 
 pub(crate) mod diagnostics;
 pub mod local_session;
+pub(crate) mod login_source;
 
 /// 会话 cookie 名：**一枚装两段**（`agent2api-panel=<access>.<refresh>`）。
 ///
@@ -596,6 +597,7 @@ fn persist_refresh_tokens(table: &mut Vec<RefreshRecord>) {
 /// 一次登录的产出：**一条** Set-Cookie 值交给 handler 下发（一枚装两段，
 /// 见 `ACCESS_COOKIE` 的说明）；裸令牌同时进响应体，供 cookie 走不通的环境
 /// 存 localStorage 后走请求头（见 `session_valid` 的头回退说明）。
+#[derive(Clone)]
 pub struct IssuedSession {
     pub session_cookie: String,
     pub access_token: String,
@@ -1494,11 +1496,9 @@ mod credential_candidate_tests {
         // 把已轮换记录拨到宽限窗之外 → 同一把旧令牌再上来就是泄露：整链作废
         {
             let mut table = refresh_tokens().lock().unwrap();
-            for record in table.iter_mut() {
-                if record.rotated {
-                    record.rotated_at = now_ms() - ROTATION_GRACE_MS - 1;
-                }
-            }
+            let hash = sha256_hex(&first.refresh_token);
+            let record = table.iter_mut().find(|record| record.hash == hash).unwrap();
+            record.rotated_at = now_ms() - ROTATION_GRACE_MS - 1;
         }
         let replayed = rotate_session(&request(&refresh_only_cookie(&first.refresh_token), &[]));
         assert!(replayed.is_none(), "宽限窗外的已轮换令牌必须判重放");

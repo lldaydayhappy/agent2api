@@ -50,6 +50,10 @@
         label: typeof item.label === 'string' && item.label ? item.label : item.id,
         count: Number(item.count) || 0,
         category: item.category === 'web' ? 'web' : 'agent',
+        dynamicLogin: item.dynamicLogin === true,
+        loginAvailable: item.loginAvailable !== false,
+        // 以后端的提供商策略和实际覆盖能力为准。
+        userAgentOverridable: item.userAgentOverridable === true,
       }));
   }
 

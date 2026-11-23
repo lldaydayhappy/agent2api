@@ -23,9 +23,10 @@ import type {
 } from './checkin-types'
 import { t } from '../i18n'
 import { DEFAULT_PAGE_SIZE, SERVER_PAGE_SIZES, readPageSize } from './table-shell'
-import type { CheckinResultRow } from '../../../ui-shared/checkin'
+import type { ActivityRunStatus, CheckinResultRow } from '../../../ui-shared/checkin'
 import { growthTaskRunnable } from '../../../ui-shared/checkin'
 import { rowCompleted, rowPending, rowMessage as resultMessage } from '../../../ui-shared/checkin-result'
+import { createRefreshRequest } from '../../../ui-shared/refresh-request'
 import { onboardingFromCenter } from './checkin-onboarding-cache'
 
 /** 新手福利的按账号缓存（明细要打上游，查一次存一次） */
@@ -86,6 +87,8 @@ type CheckinBridge = {
   getCheckinCenter?: () => Promise<CheckinCenter | null | undefined>
   checkinAllAccounts?: (id?: string) => Promise<CheckinRunResult | null | undefined>
   runCheckinActivity?: (id: string, mode: string) => Promise<CheckinRunResult | null | undefined>
+  getCheckinActivityStatus?: (id: string) => Promise<ActivityRunStatus | undefined>
+  resetCheckinActivity?: (id: string) => Promise<{ cleared?: string[]; message?: string } | null | undefined>
   getCheckinRecords?: (params: Record<string, unknown>) => Promise<RecordsPage | null | undefined>
   clearCheckinRecords?: (params: Record<string, unknown>) => Promise<unknown>
   getCheckinSchedules?: () => Promise<AutoState | null | undefined>
@@ -136,6 +139,9 @@ export type UmidState = {
   available?: boolean
   installing?: boolean
   installSupported?: boolean
+  authorized?: boolean
+  componentAvailable?: boolean
+  message?: string
 }
 
 /** 批量签到返回汇总与 results，活动分档接口直接返回账号行。 */
@@ -223,6 +229,7 @@ export type Store = {
   records: RecordRow[]
   recordsTotal: number
   recordsLoaded: boolean
+  recordsStale: boolean
   recordsError: string
   recordsLoading: boolean
   recordsQuery: {
@@ -238,8 +245,11 @@ export type Store = {
   }
   /** 新手福利的任务缓存：账号 id → 缓存（切标签页不丢） */
   onboarding: Map<string, OnboardingCache>
+  onboardingBatch: string[] | null
+  plansBatch: 'query' | 'claim' | null
   /** 成长任务的缓存：账号 id → 缓存 */
   growth: Map<string, GrowthCache>
+  growthBatch: { mode: 'full' | 'claim'; accountIds: string[] } | null
 }
 
 const recordsPageSize = readPageSize('checkin-records', SERVER_PAGE_SIZES)
@@ -259,6 +269,7 @@ export const store: Store = {
   records: [],
   recordsTotal: 0,
   recordsLoaded: false,
+  recordsStale: false,
   recordsError: '',
   recordsLoading: false,
   recordsQuery: {
@@ -266,7 +277,10 @@ export const store: Store = {
     offset: 0, outcome: '', kind: '', provider: '', keyword: '',
   },
   onboarding: new Map(),
+  onboardingBatch: null,
+  plansBatch: null,
   growth: new Map(),
+  growthBatch: null,
 }
 
 const listeners = new Set<() => void>()
@@ -286,29 +300,48 @@ export function patch(next: Partial<Store>): void {
 
 /* ─── 读 ───────────────────────────────────── */
 
-let centerRequest = 0
+const CENTER_SKIP_MS = 4_000
+const CENTER_FRESH_MS = 15_000
+let centerLoadedAt = 0
 
-/** 拉聚合快照（页面打开 / 任何写动作之后） */
-export async function loadCenter(): Promise<void> {
-  const request = ++centerRequest
+export function invalidateCenter(): void {
+  centerLoadedAt = 0
+}
+
+const refreshCenter = createRefreshRequest(async isCurrent => {
   try {
     const data = await bridge().getCheckinCenter?.()
-    if (request !== centerRequest) return
+    if (!isCurrent()) return
     if (!data) {
       patch({ loaded: true, loadError: '后端未返回签到中心数据' })
       return
     }
+    centerLoadedAt = Date.now()
     patch({
       center: data,
       onboarding: onboardingFromCenter(data, store.onboarding),
       loaded: true,
       loadError: '',
-      // 快照到手 = 草稿该跟着它走（写动作成功后也会清，两处不冲突）
       keepaliveDraft: null,
       travelTimesDraft: null,
     })
   } catch (error) {
-    if (request === centerRequest) patch({ loaded: true, loadError: errorMessage(error) })
+    if (isCurrent()) patch({ loaded: true, loadError: errorMessage(error) })
+  }
+})
+
+export function loadCenter(afterChange = false): Promise<void> {
+  return refreshCenter(afterChange)
+}
+
+export async function loadCenterIfStale(): Promise<void> {
+  const age = Date.now() - centerLoadedAt
+  if (!store.loaded || centerLoadedAt === 0 || age >= CENTER_FRESH_MS) {
+    await loadCenter(centerLoadedAt === 0 && store.loaded)
+    return
+  }
+  if (age >= CENTER_SKIP_MS) {
+    void loadCenter()
   }
 }
 
@@ -337,11 +370,14 @@ export async function loadRecords(): Promise<void> {
       await loadRecords()
       return
     }
+    const unfiltered = !query.outcome && !query.kind && !query.provider && !query.keyword && query.start == null
     patch({
       records: Array.isArray(data?.records) ? data.records : [],
       recordsTotal: total,
       recordsLoaded: true,
+      recordsStale: false,
       recordsError: '',
+      ...(unfiltered && store.center ? { center: { ...store.center, recordsTotal: total } } : {}),
     })
   } catch (error) {
     if (request === recordsRequest) patch({ recordsLoaded: true, recordsError: errorMessage(error) })
@@ -366,7 +402,10 @@ async function run<T>(
   patch({ saving: true })
   try {
     const result = await action()
-    if (options.reload !== false) await loadCenter()
+    if (options.reload !== false) {
+      patch({ recordsStale: true })
+      await loadCenter(true)
+    }
     if (options.success) toast(options.success)
     return result
   } catch (error) {
@@ -387,8 +426,8 @@ export async function runAllCheckin(accountId?: string): Promise<void> {
   } catch (error) {
     toast(`签到失败：${errorMessage(error)}`, 'err')
   } finally {
-    patch({ runningAll: false })
-    await loadCenter()
+    patch({ runningAll: false, recordsStale: true })
+    await loadCenter(true)
   }
 }
 
@@ -409,8 +448,8 @@ export async function signSingle(accountId: string, mode: string): Promise<void>
   } finally {
     const after = new Set(store.signing)
     after.delete(key)
-    patch({ signing: after })
-    await loadCenter()
+    patch({ signing: after, recordsStale: true })
+    await loadCenter(true)
   }
 }
 
@@ -459,7 +498,7 @@ export async function toggleMaster(enabled: boolean): Promise<void> {
     },
     { success: enabled ? '✅ 定时签到已开启' : '定时签到已关闭', reload: false, failure: '保存失败' },
   )
-  void loadCenter()
+  void loadCenter(true)
 }
 
 /** 保存一条定时条目（`closeEditor: false` = 行上的快捷开关，不收表单不弹提示） */
@@ -479,7 +518,7 @@ export async function saveScheduleEntry(
     },
     { success: options.silent ? undefined : '✅ 已保存', reload: false, failure: '保存失败' },
   )
-  if (saved) void loadCenter()
+  if (saved) void loadCenter(true)
   return saved === true
 }
 
@@ -503,8 +542,8 @@ export async function runScheduleEntry(id: string): Promise<void> {
   } catch (error) {
     toast(`执行失败：${errorMessage(error)}`, 'err')
   } finally {
-    patch({ runningScheduleId: null })
-    await loadCenter()
+    patch({ runningScheduleId: null, recordsStale: true })
+    await loadCenter(true)
   }
 }
 
@@ -575,6 +614,7 @@ export async function clearRecords(all: boolean): Promise<void> {
     { success: '签到记录已清空', reload: false, failure: '清空失败' },
   )
   await loadRecords()
+  if (!all) void loadCenter(true)
 }
 
 /* ─── 成长任务（WorkBuddy 国内版）───────────── */
@@ -624,7 +664,7 @@ function normalizeGrowthTask(raw: unknown): GrowthTask | null {
 /** 查询一个账号的成长任务盘点（只读，打一次上游） */
 export async function queryGrowth(id: string): Promise<void> {
   const current = growthOf(id)
-  if (current.status === 'loading' || current.running) return
+  if (current.status === 'loading' || current.running || current.runningSchool) return
   patchGrowth(id, { status: 'loading', error: '' })
   try {
     const data = await bridge().getGrowthStatus?.(id)
@@ -657,7 +697,7 @@ export async function queryGrowth(id: string): Promise<void> {
  */
 export async function runGrowth(id: string, mode: 'full' | 'claim'): Promise<void> {
   const current = growthOf(id)
-  if (current.running) return
+  if (current.status !== 'loaded' || current.running || current.runningSchool) return
   const targets = current.tasks.filter(task => growthTaskRunnable(task, mode))
   if (targets.length === 0) {
     toast('没有需要执行的任务')
@@ -684,6 +724,31 @@ export async function runGrowth(id: string, mode: 'full' | 'claim'): Promise<voi
   patchGrowth(id, { running: false })
   toast(failed > 0 ? `执行完成，${failed} 项失败` : '✅ 执行完成', failed > 0 ? 'err' : 'ok')
   await queryGrowth(id)
+}
+
+export async function runGrowthBatch(accountIds: string[], mode: 'full' | 'claim'): Promise<void> {
+  if (store.growthBatch) return
+  const ids = [...new Set(accountIds)].filter(id => {
+    const cache = growthOf(id)
+    return cache.status !== 'loading' && !cache.running && !cache.runningSchool
+  })
+  if (ids.length === 0) return
+  patch({ growthBatch: { mode, accountIds: ids } })
+  try {
+    for (const id of ids) {
+      await queryGrowth(id)
+      const cache = growthOf(id)
+      if (cache.status !== 'loaded' || cache.error) {
+        toast(t('查询失败：{error}', { error: cache.error || id }), 'err')
+        continue
+      }
+      await runGrowth(id, mode)
+    }
+  } catch (error) {
+    toast(t('成长任务执行失败：{error}', { error: errorMessage(error) }), 'err')
+  } finally {
+    patch({ growthBatch: null })
+  }
 }
 
 /** 开学季任务 + 抽奖 */

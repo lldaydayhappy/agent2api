@@ -109,17 +109,6 @@ export type ProviderConfig = {
    */
   guestLogin?: { noteHtml: string; button: string; busyText?: string; namePlaceholder?: string }
   regionOptions?: RegionOption[]
-  /**
-   * 这一家的登录 / 添加链路要不要显示「登录出网代理」选择器。
-   *
-   * ── 为什么需要这个开关（而不是全开）──────────────────────────
-   * 只有上游在常见网络里**必须经代理才可达**的家才需要它 —— 今天只有
-   * Antigravity（Google）。其余家直连就能到，多一个代理框只会让用户以为
-   * 「不选代理就用不了」。开关打开后：网页登录把代理放进 `options.proxy`
-   * 交给网关的 `login.start`，粘贴凭据把代理放进 `POST /api/accounts` 的
-   * `proxy` 字段（两条路都由插件在自己的出网链路上使用）。
-   */
-  loginProxy?: boolean
   /** false = 这一家没有「从本机导入桌面端登录态」这一条来源 */
   desktop?: boolean
   desktopNote?: string
@@ -391,12 +380,7 @@ const QWENWORK_INTL = qwenworkForm({
 })
 
 /**
- * Cline 是两个提供商（Cline Free / Cline Pass）。
- *
- * 为什么不是一个配置带一个「额度池」下拉：上游模型带计费通道前缀
- * （`cline-free/…` / `cline-pass/…`），池是**账号的属性**，混在一起会让
- * 「哪个池能用」在界面上看不出来、同一模型的启停规则跨池互相影响。
- * 按两家建模后各占一个分组、各有一套账号与模型清单。除 id / 标签 / 文案外同构。
+ * Cline Free（免费额度池）；Cline Pass 已改为软件内置「API 模板」。
  */
 function clineForm(spec: { provider: string; label: string; poolNote: string }): ProviderConfig {
   const { provider, label, poolNote } = spec
@@ -780,9 +764,6 @@ const ANTIGRAVITY: ProviderConfig = {
   provider: 'antigravity',
   label: t('Antigravity'),
   desktop: false,
-  // 上游是 Google：多数网络里只有经代理才可达。无头服务器上没有系统代理，
-  // 「登录 / 换证出网线路」只能由用户在这里选（见 `loginProxy` 的说明）。
-  loginProxy: true,
   // 网页登录：Google 账号授权页 + loopback 回调。回调落在网关自己的端口，
   // 所以两种打开方式都可用（会复用系统浏览器里已登录的 Google 账号）。
   webLogin: {
@@ -1109,9 +1090,8 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // 国内版在前，与后端注册表 PROVIDERS 的排列一致
   QWENWORK,
   QWENWORK_INTL,
-  // Cline 顺序即界面上「提供商」分段的顺序：免费池在前（无门槛，更常用）
+  // Cline 免费池（订阅池已改为内置「Cline Pass」API 模板）
   clineForm({ provider: 'cline-free', label: 'Cline Free', poolNote: t('（免费额度池，模型名带 cline-free/ 前缀）。') }),
-  clineForm({ provider: 'cline-pass', label: 'Cline Pass', poolNote: t('（订阅池，模型名带 cline-pass/ 前缀，需要账号有对应订阅）。') }),
   // Accio 顺序：国际版在前（默认安装的版本）
   accioForm({ provider: 'accio', label: t('国际版'), site: 'www.accio.com', siteNote: t('国际版与国内版是**两套独立的账号**（同一账号体系的两个站点），凭证不通用。') }),
   accioForm({ provider: 'accio-cn', label: t('国内版'), site: 'www.accio-ai.com', siteNote: t('国内版的登录站点是 www.accio-ai.com，与国际版不是同一站。') }),

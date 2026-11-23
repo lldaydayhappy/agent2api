@@ -42,6 +42,7 @@ use crate::server::core::billing::WorkbuddyActivity;
 use crate::server::logging;
 
 mod summary;
+mod workbuddy;
 pub(crate) use summary::failure_of;
 
 /// 签到路径上的错误。对应 Node 版抛出的 AccountStoreError：
@@ -190,63 +191,16 @@ fn is_available(account: &Value) -> bool {
         .unwrap_or(true)
 }
 
-/// 这条会话是不是企业版账号（`account.enterpriseId` 非空）。
-///
-/// 企业版没有个人成长 / 补偿体系：上游对签到、活动补偿这类个人计费端点
-/// 固定回 400 code 10001（参考实现 workbuddy2api-panel 的 A/B 实测，
-/// 2026-10-07）。活动补偿那一步据此直接跳过，省一次注定失败的请求 ——
-/// 判据只此一份，与 `AuthService`「enterpriseId 为 null 就不显示企业标记」
-/// 同一口径（空串按个人版处理）。
-fn is_enterprise_session(session: &Value) -> bool {
-    session
-        .get("account")
-        .and_then(|account| account.get("enterpriseId"))
-        .and_then(Value::as_str)
-        .is_some_and(|value| !value.is_empty())
-}
-
-/// 账号列表快照（`store.listAccounts().accounts`）
-fn accounts_of(store: &AccountStore) -> Vec<Value> {
-    store
-        .list_accounts()
-        .get("accounts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// 签到目标集合。
-///
-/// 批量（`id` 为空）：可用账号 ∩ **提供商在 `providers` 范围内** ∩ 非国际版，
-/// `skipped` = 可用总数 − 可签到数。范围由配置给出（WorkBuddy / 小浣熊 / AutoClaw
-/// 可勾选），定时签到与账号页批量签到共用同一份口径。**禁用账号照常参与** ——
-/// 签到与转发是两件事（见模块头「签到不看 enabled」）。
-///
-/// 指定 id：命中即用（**不过滤 available，也不过滤 provider**），
-/// 国际版直接报 400 —— 用户点的是谁就签谁，与「显式指定就执行」的既有语义一致；
-/// 批量路径必须过滤 available 与 provider，否则会把范围外的账号也签一遍。
-///
-/// ── 两条路径的「不满足条件」为什么语义不同（有意如此）──────────
-///   批量路径 → **静默跳过**（计入 `skipped`）：定时任务会一次扫过几十个账号，
-///     用户没在看着，为一个「国际版没有签到活动」把整轮任务报错没有意义。
-///   单账号路径 → **明确 400 + 原因**：用户显式点了某个账号的按钮，
-///     他需要知道为什么不行。静默成功或静默跳过都会让他以为签到了。
-/// 所以 `supports_checkin` 在单账号路径报错、在批量路径过滤掉 ——
-/// **不要为了「统一」把其中一处改掉**。
 pub fn resolve_checkin_targets(
     store: &AccountStore,
     providers: &[String],
     id: Option<&str>,
 ) -> Result<(Vec<Value>, usize), CheckinError> {
-    let all = accounts_of(store);
+    let snapshot = store.routing_snapshot();
     if let Some(id) = id.filter(|value| !value.is_empty()) {
-        let found: Vec<Value> = all
-            .into_iter()
-            .filter(|account| account.get("id").and_then(Value::as_str) == Some(id))
-            .collect();
-        if found.is_empty() {
+        let Some(found) = snapshot.public_by_id.get(id) else {
             return Err(CheckinError::new("账号不存在", 404));
-        }
+        };
         // 唯一的拒绝理由：上游这一站根本没有签到/活跃任务（Qoder 等的国际版）。
         // 文案与签到中心「范围外」分组那句同义 —— 两处说法不一致会让用户以为
         // 遇到的是两个不同的问题。WorkBuddy 国际版已由活跃任务分支放行。
@@ -254,8 +208,8 @@ pub fn resolve_checkin_targets(
         // 访客单独给一句：它「不支持签到」的原因与别家不同（不是这一站没接链
         // 路，而是访客本来就没有积分体系），用户看到「该账号暂不支持签到」
         // 会去翻设置找原因。文案与签到中心的范围外原因同义。
-        if !supports_checkin(&found[0]) {
-            if found[0].get("isGuest").and_then(Value::as_bool) == Some(true) {
+        if !supports_checkin(found) {
+            if found.get("isGuest").and_then(Value::as_bool) == Some(true) {
                 return Err(CheckinError::new(
                     "访客账号没有积分体系，仅登录账号可签到",
                     400,
@@ -263,14 +217,20 @@ pub fn resolve_checkin_targets(
             }
             return Err(CheckinError::new("该账号暂不支持签到或每日活跃任务", 400));
         }
-        return Ok((found, 0));
+        return Ok((vec![found.as_ref().clone()], 0));
     }
-    let available: Vec<Value> = all.into_iter().filter(is_available).collect();
+    let available: Vec<&Value> = snapshot
+        .public_accounts
+        .iter()
+        .map(std::sync::Arc::as_ref)
+        .filter(|account| is_available(account))
+        .collect();
     let total = available.len();
     let eligible: Vec<Value> = available
         .into_iter()
-        .filter(supports_checkin)
+        .filter(|account| supports_checkin(account))
         .filter(|account| matches_provider_filter(account, providers))
+        .cloned()
         .collect();
     let skipped = total - eligible.len();
     Ok((eligible, skipped))
@@ -327,11 +287,28 @@ pub async fn checkin_for(
     if crate::server::core::plugin_host::serves_provider(provider_id) {
         if let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(provider_id) {
             if adapter.plugin_checkin_capability() == Some(true) {
+                let daily = store.plugin_ledger(&id, "dailyCheckin");
+                if let Some(until) = crate::server::core::account_store::checkin_state::rolling_until(&daily)
+                    .filter(|until| *until > logging::now_ms())
+                {
+                    let outcome = daily.get("status").and_then(Value::as_str).unwrap_or("inactive");
+                    let outcome = if outcome == "claimed" { "done" } else { outcome };
+                    let claim = json!({ "success": false, "alreadyCompleted": outcome == "done",
+                        "outcome": outcome, "msg": daily.get("message"), "until": until,
+                        "cached": true, "dailyCheckin": daily });
+                    return claim_result(id.clone(), name, &display, true, Ok(claim));
+                }
                 let claim = adapter
                     .checkin_claim_with_options(store, &id, manual)
                     .await
                     .map_err(|error| error.message);
-                return claim_result(id, name, &display, true, claim);
+                let mut row = claim_result(id.clone(), name, &display, true, claim);
+                if provider_id == crate::server::core::providers::DEFAULT_PROVIDER_ID {
+                    if let Some(entry) = store.get_session_by_id(&id) {
+                        workbuddy::attach_growth(store, &id, &entry.session, &display, &mut row).await;
+                    }
+                }
+                return row;
             }
         }
     }
@@ -369,16 +346,24 @@ pub async fn checkin_for(
                 .unwrap_or_else(|| json!({ "success": false, "code": -1, "msg": "活跃任务未返回领取结果" }));
             let claim_success = claim.get("success").and_then(Value::as_bool).unwrap_or(false);
             let message = claim.get("msg").and_then(Value::as_str).unwrap_or("");
+            let activity_node = activity.get("activity").cloned().unwrap_or(Value::Null);
+            let detail = crate::server::core::billing::keepalive::activity_failure_detail(&activity_node);
             if claim_success {
-                logging::log("[Accounts]", &format!("账号 {display}: 签到成功"));
+                match detail.as_deref() {
+                    Some(detail) => logging::log("[Accounts]", &format!("账号 {display}: 签到成功（保活未全过：{detail}）")),
+                    None => logging::log("[Accounts]", &format!("账号 {display}: 签到成功")),
+                }
             } else {
-                logging::log("[Accounts]", &format!("账号 {display}: WorkBuddy 国际版 {message}"));
+                match detail.as_deref() {
+                    Some(detail) if !message.contains(detail) => logging::log("[Accounts]", &format!("账号 {display}: WorkBuddy 国际版 {message}（{detail}）")),
+                    _ => logging::log("[Accounts]", &format!("账号 {display}: WorkBuddy 国际版 {message}")),
+                }
             }
             json!({
                 "id": id,
                 "name": name,
                 "claim": claim,
-                "activity": activity.get("activity").cloned().unwrap_or(Value::Null),
+                "activity": activity_node,
                 "error": Value::Null,
             })
         }
@@ -401,139 +386,7 @@ pub async fn checkin_for(
         // 现在落到这里的未知家明确报「未接入」，新增一家时忘了加分支会立刻暴露
         // （WorkBuddy 国际版拆家后是独立 id，走上面的 workbuddy-intl 分支）。
         _ if provider_id == crate::server::core::providers::DEFAULT_PROVIDER_ID => {
-            let Some(entry) = store.get_session_by_id(&id) else {
-                return json!({
-                    "id": id,
-                    "name": name,
-                    "claim": Value::Null,
-                    "error": "没有可用凭证",
-                });
-            };
-            let claim = billing
-                .claim_daily_checkin(Some(&entry.session))
-                .await
-                .map_err(|error| error.message);
-            let mut row = claim_result(id.clone(), name, &display, false, claim);
-            // ── 每日活跃上报：点亮成长中心连登 / 活跃地图 ──────────────
-            // 签到（`daily-checkin`）只推进**签到活动**自己的连签，成长中心的
-            // 连登与热力图只认 `/v2/report` 的一条 `chat_request_send` 事件
-            // （2026-10-19 实测：签到后签到连签 14→15，而 `growth/streak`
-            // 的 days 与当日热力格一格未动；补发一条上报后 0→1 / 0→2）。
-            // 见 `growth::daily_activity` 的模块头。
-            //
-            // 结果落在行的 `growth` 键上，**刻意不叫 `activity`**：那个键是
-            // 国际版日活链路的读数，`day_completed` / 台账会把它当成「今天
-            // 已完成」—— 对国内版，上报只点亮地图，不等于积分领到了，
-            // 混用会让签到失败的账号被记成已签。
-            //
-            // 企业版没有个人成长体系（`/activity/growth/*` 一律 403），
-            // 与下面两条一次性奖励同一门控；上报对它零收益（上游仍回 200）。
-            if !is_enterprise_session(&entry.session) {
-                // ── 每日活跃上报：点亮成长中心连登 / 活跃地图 ──────────────
-                // 实现（`/v2/report` 的事件形状、按天幂等记忆、竞态读数过滤）
-                // 全在**插件**里（`workbuddy::admin` 的 `growth.daily`）。
-                // 网关这边只剩「把读数落库 + 记日志」——`mark_streak_days`
-                // 动的是网关的账号库，插件写不到。
-                let growth_row = match crate::server::core::providers::adapter::adapter_by_id(
-                    provider_id,
-                ) {
-                    Some(adapter) => {
-                        match adapter
-                            .admin_action(store, &id, "growth.daily", &Value::Null)
-                            .await
-                        {
-                            Ok(row) => {
-                                let days = row.get("streakDays").and_then(Value::as_i64);
-                                if let Some(days) = days {
-                                    if !store.mark_streak_days(&id, days) {
-                                        logging::verbose(
-                                            "[Accounts]",
-                                            &format!("账号 {id} 的连登天数未能落盘"),
-                                        );
-                                    }
-                                }
-                                let sent =
-                                    row.get("reported").and_then(Value::as_bool).unwrap_or(false);
-                                if sent {
-                                    logging::verbose(
-                                        "[Accounts]",
-                                        &format!(
-                                            "账号 {display}: 每日活跃已上报{}",
-                                            days.map(|days| format!("（连登 {days} 天）"))
-                                                .unwrap_or_default()
-                                        ),
-                                    );
-                                }
-                                row
-                            }
-                            // 附加收益失败：只记日志，绝不影响签到结果
-                            Err(error) => {
-                                logging::verbose(
-                                    "[Accounts]",
-                                    &format!("账号 {display} 每日活跃上报失败: {}", error.message),
-                                );
-                                json!({
-                                    "reported": false,
-                                    "streakDays": Value::Null,
-                                    "error": error.message,
-                                })
-                            }
-                        }
-                    }
-                    None => json!({
-                        "reported": false,
-                        "streakDays": Value::Null,
-                        "error": "没有可用的 WorkBuddy 适配器（未安装插件？）",
-                    }),
-                };
-                if let Some(object) = row.as_object_mut() {
-                    object.insert("growth".to_string(), growth_row);
-                }
-            }
-            // ── 一次性运营奖励：挂在签到末尾顺带领 ────────────────
-            // 新手礼包与活动补偿（如 2026-10 的 DeepSeek 故障补偿 500 积分）
-            // 都没有自己的入口，官方口径是去「用量管理 / 个人中心」手动点领取
-            // —— 网关替账号走这两下（参考实现 workbuddy2api-hub 的连登管家把
-            // 两条一起挂在签到后，同一口径）。每号一次，已领 / 无可领取静默
-            // 跳过，不影响签到结果本身；真的到账才出声（日志 + 行内读数）。
-            // 企业版没有个人成长 / 补偿体系（上游固定回 400 code 10001），
-            // 直接不发这两条。
-            if !is_enterprise_session(&entry.session) {
-                let mut rewards: Vec<Value> = Vec::new();
-                for reward in [
-                    billing.claim_gift(&entry.session).await,
-                    billing.claim_compensation(&entry.session).await,
-                ] {
-                    match reward {
-                        Ok(reward) => {
-                            let credited = reward.get("success").and_then(Value::as_bool)
-                                == Some(true)
-                                && reward.get("credit").and_then(Value::as_i64).unwrap_or(0) > 0;
-                            if credited {
-                                let message =
-                                    reward.get("msg").and_then(Value::as_str).unwrap_or("");
-                                logging::log(
-                                    "[Accounts]",
-                                    &format!("账号 {display}: {message}"),
-                                );
-                            }
-                            rewards.push(reward);
-                        }
-                        Err(error) => {
-                            logging::verbose(
-                                "[Accounts]",
-                                &format!("账号 {display} 运营奖励未领取: {}", error.message),
-                            );
-                        }
-                    }
-                }
-                if !rewards.is_empty() {
-                    if let Some(object) = row.as_object_mut() {
-                        object.insert("rewards".to_string(), Value::Array(rewards));
-                    }
-                }
-            }
-            row
+            workbuddy::checkin(store, billing, id, name, &display).await
         }
         // AtomCode 的「签到」（领取免费 CodingPlan）已随实现搬到插件，
         // 走上面那条插件分支（`plugin_checkin_capability`）。
@@ -765,6 +618,13 @@ pub(crate) async fn run_checkin_selected(
     let manual = matches!(source, "single" | "manual");
     let mut results = Vec::with_capacity(targets.len());
     for account in &targets {
+        if !manual && crate::server::core::plugin_host::operations::active_for_provider(provider_of(account)) {
+            results.push(json!({ "id": account["id"], "name": account["name"], "claim": {
+                "success": false, "outcome": "inactive", "code": "plugin_installing",
+                "msg": "插件正在安装或更新，本次自动签到暂缓，等待重试", "retryAt": logging::now_ms() + 120_000,
+            }, "error": Value::Null, "deferred": true }));
+            continue;
+        }
         let row = checkin_for(store, billing, account, manual).await;
         // 落签到时间：手动单签与定时签到走的是**这一段**（两条链都调本函数），
         // 所以账号页的「已签到」在两种路径下都会亮起来，不需要各自记一次。
@@ -773,7 +633,8 @@ pub(crate) async fn run_checkin_selected(
         if let Some(account_id) = row.get("id").and_then(Value::as_str) {
             // 判据是 [`day_completed`]（claim 说完成，或国际版活跃链路完成）——
             // 与台账的 outcome 判定同源；判据只此一份，别在这里再写一份。
-            if day_completed(&row) && !store.mark_checkin(account_id, logging::now_ms()) {
+            if day_completed(&row) && row.get("claim").and_then(|claim| claim.get("cached")).and_then(Value::as_bool) != Some(true)
+                && !store.mark_checkin(account_id, logging::now_ms()) {
                 logging::verbose(
                     "[Accounts]",
                     &format!("账号 {account_id} 的签到时间未能落盘（账号可能已被删除）"),
@@ -820,6 +681,24 @@ pub(crate) async fn run_checkin_selected(
         })
         .count();
     let failures: Vec<String> = results.iter().filter_map(failure_of).collect();
+    if !manual {
+        let detailed_failures: Vec<String> = targets
+            .iter()
+            .zip(results.iter())
+            .filter_map(|(account, item)| {
+                let detail = failure_of(item)?;
+                let label = crate::server::core::providers::label_of(provider_of(account));
+                Some(format!("[{label}] {detail}"))
+            })
+            .collect();
+        if !detailed_failures.is_empty() {
+            crate::server::core::notifications::notify_checkin_failure(
+                source,
+                reason,
+                &detailed_failures,
+            );
+        }
+    }
     if skipped > 0 {
         logging::log(
             "[Accounts]",

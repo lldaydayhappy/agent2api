@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -183,12 +184,27 @@ pub fn config_dir() -> PathBuf {
 /// 通用 60 秒是给「管理 API 小请求」定的；云同步的上传 / 下载要打外网传几 MB，
 /// 慢速云盘上 60 秒根本不够。放宽的是**这一条命令**的超时，不是全局 ——
 /// 其它管理请求仍应快速失败（卡住的面板比报错更难排查）。
-pub(crate) fn local_client(timeout: Duration) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .no_proxy()
-        .timeout(timeout)
-        .build()
-        .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))
+/// 全局复用的本机管理请求 Client（跳过系统代理，按单次请求覆盖超时）。
+///
+/// 避免每次调接口都重新分配连接池与 socket，让 `127.0.0.1` 的 keep-alive 连接得以持续复用。
+pub(crate) fn local_client() -> Result<&'static reqwest::Client, String> {
+    static SHARED_LOCAL_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    SHARED_LOCAL_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn management_timeout(path: &str, timeout_ms: u64) -> Duration {
+    if path.split('?').next() != Some("/api/accounts/usage") {
+        return Duration::from_millis(timeout_ms);
+    }
+    Duration::from_secs(195)
 }
 
 fn request_builder_with_timeout(
@@ -198,7 +214,8 @@ fn request_builder_with_timeout(
     timeout_ms: u64,
 ) -> Result<reqwest::RequestBuilder, String> {
     let url = format!("http://127.0.0.1:{}{path}", proxy_port());
-    let base = local_client(Duration::from_millis(timeout_ms))?;
+    let base = local_client()?;
+    let timeout = management_timeout(path, timeout_ms);
     let mut builder = match method.to_uppercase().as_str() {
         "GET" => base.get(&url),
         "POST" => base.post(&url),
@@ -207,7 +224,7 @@ fn request_builder_with_timeout(
         "DELETE" => base.delete(&url),
         other => return Err(format!("不支持的请求方法: {other}")),
     };
-    builder = builder.header("Accept", "application/json");
+    builder = builder.timeout(timeout).header("Accept", "application/json");
     builder = crate::panel_session::attach(builder)?;
     // 与原实现一致：POST/PUT/PATCH 即使无参数也发一个空对象，
     // 后端部分路由按「有 body」判定，省略会让它们走错分支
@@ -242,7 +259,7 @@ pub async fn call_with_api_key(method: &str, path: &str, body: Option<&Value>, a
             .map_err(|_| "API Key 包含无效的请求头字符".to_string())?;
         request.headers_mut().insert("x-api-key", key);
         let credentials = request.headers().clone();
-        let response = local_client(Duration::from_millis(REQUEST_TIMEOUT_MS))?.execute(request).await
+        let response = local_client()?.execute(request).await
             .map_err(|error| describe_transport_error(&error))?;
         let status = response.status().as_u16();
         let text = response.text().await.map_err(|error| format!("读取响应失败: {error}"))?;
@@ -268,9 +285,55 @@ pub async fn call_with_timeout(
     body: Option<&Value>,
     timeout_ms: u64,
 ) -> Result<Value, String> {
+    call_with_retry_policy(method, path, body, timeout_ms, false).await
+}
+
+pub async fn call_without_auth_replay(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    call_with_retry_policy(method, path, body, REQUEST_TIMEOUT_MS, true).await
+}
+
+async fn call_with_retry_policy(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout_ms: u64,
+    never: bool,
+) -> Result<Value, String> {
+    let generation = crate::panel_session::revision();
+    let no_auth_replay = never || url::Url::parse(&format!("http://127.0.0.1:{}{path}", proxy_port()))
+        .is_ok_and(|url| {
+            let path = url.path();
+            path.starts_with("/api/plugins/desktop-import/chatglm/")
+                || path.starts_with("/api/plugins/desktop-launch/")
+                || method.eq_ignore_ascii_case("PATCH") && path == "/api/plugins/permissions"
+                || method.eq_ignore_ascii_case("POST")
+                    && (path == "/api/accounts"
+                        || path == "/api/accounts/refresh" || path == "/api/accounts/refresh-expiring"
+                        || path == "/api/zcode/captcha"
+                        || path.starts_with("/api/session/login/")
+                        || path == "/api/zcode/claim-verification"
+                            && body.and_then(|value| value.get("action")).and_then(Value::as_str) == Some("complete")
+                        || path == "/api/accounts/checkin"
+                        || path == "/api/plugins/tasks/run"
+                        || path == "/api/travel-schedule/run"
+                        || path.ends_with("/growth/travel") || path.ends_with("/growth/task") || path.ends_with("/growth/school")
+                        || path == "/api/checkin-activity"
+                        || path == "/api/checkin-activity/reset"
+                        || path.ends_with("/campaigns/claim") || path.ends_with("/campaigns/redeem")
+                        || path.ends_with("/onboarding/claim")
+                        || path.strip_prefix("/api/accounts/").and_then(|rest| rest.strip_suffix("/zcode-claim"))
+                            .is_some_and(|account| !account.is_empty() && !account.contains('/')))
+        });
     crate::startup::wait().await?;
-    let first = send_once(method, path, body, timeout_ms).await?;
-    if recover_management_session(&first, path)? {
+    let first = send_once_with_source(method, path, body, timeout_ms, no_auth_replay.then_some(generation)).await?;
+    if no_auth_replay && crate::panel_session::revision() != generation {
+        return Err("本机管理会话已变化，本次确认或请求没有自动重发；请重新读取状态".into());
+    }
+    let recovered = recover_management_session(&first, path)?;
+    if recovered && no_auth_replay {
+        return Err("本机管理会话已变化，本次确认或请求没有自动重发；请重新读取状态".into());
+    }
+    if recovered {
         let retried = send_once(method, path, body, timeout_ms).await?;
         return unwrap_envelope(&retried.text, retried.status);
     }
@@ -304,10 +367,23 @@ async fn send_once(
     body: Option<&Value>,
     timeout_ms: u64,
 ) -> Result<RawResponse, String> {
+    send_once_with_source(method, path, body, timeout_ms, None).await
+}
+
+async fn send_once_with_source(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout_ms: u64,
+    generation: Option<u64>,
+) -> Result<RawResponse, String> {
     let request = request_builder_with_timeout(method, path, body, timeout_ms)?.build()
         .map_err(|error| format!("构造管理请求失败: {error}"))?;
+    if generation.is_some_and(|generation| crate::panel_session::revision() != generation) {
+        return Err("本机管理会话已变化，本次确认或请求没有自动重发；请重新读取状态".into());
+    }
     let credentials = request.headers().clone();
-    let response = local_client(Duration::from_millis(timeout_ms))?
+    let response = local_client()?
         .execute(request)
         .await
         .map_err(|error| describe_transport_error(&error))?;

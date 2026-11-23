@@ -13,11 +13,11 @@ import {
   type CustomModelContext, type MappingContext,
 } from './models-panel-state'
 import { t } from '../i18n'
+import { SearchableSelect } from '../../../ui-shared/searchable-select'
 
 /* ─── 映射弹窗 ───────────────────────────────── */
 
-/** 映射等级只在客户端未显式指定思考参数时作为默认值。 */
-const REASONING_TIP = t('思考等级绑定是这条映射的默认值，客户端显式指定时不覆盖。WorkBuddy 按当前地区的上游目录注入 reasoning_effort；不支持的正向等级取不高于请求的最高可用档，固定档位不能调高，目录未声明时跳过。off / none 不由映射注入；自定义等级只有提供商能确认支持时才发送。注入、归一与跳过原因写入详细日志。')
+const REASONING_TIP = t('设置思考等级后，会覆盖下游请求中的等级；选择“不覆盖”则保留下游参数。实际档位以提供商支持范围为准，无法注入时保留原请求并记录原因。off / none 仍不由映射注入。')
 
 /** 上游下拉的初值：候选里有就用候选里的原始拼写（value 必须与 option 逐字相同才会选中） */
 function pickUpstream(providerId: string, keep: string, locked: boolean): string {
@@ -287,6 +287,7 @@ export function MappingDialog({ context, onClose }: { context: MappingContext; o
 export function CustomModelDialog({ initial, onClose }: { initial: CustomModelContext; onClose: () => void }) {
   const [provider, setProvider] = React.useState(initial.provider)
   const [id, setId] = React.useState('')
+  const [protocol, setProtocol] = React.useState('__default__')
   const [status, setStatus] = React.useState('')
   const [saving, setSaving] = React.useState(false)
 
@@ -300,6 +301,18 @@ export function CustomModelDialog({ initial, onClose }: { initial: CustomModelCo
   // 候选里没有当前值时退回首项（原生 select 赋一个不存在的值也是这个结果）
   const providerValue = choices.some(item => item.id === provider) ? provider : (choices[0]?.id || '')
   const providerLabel = choices.find(item => item.id === providerValue)?.label || providerValue || t('(未选)')
+  const isCustomProvider = customSource.isCustom(providerValue)
+  const providerRecord = isCustomProvider ? customSource.record(providerValue) : null
+  const defaultProtocol = customSource.normalizeCustomProtocol(providerRecord?.protocol) || 'chat_completions'
+  const inferredProtocol = isCustomProvider ? customSource.inferPresetModelProtocol(providerRecord, id) : undefined
+  const explicitProtocol = protocol === '__default__' ? undefined : customSource.normalizeCustomProtocol(protocol)
+  const effectiveProtocol = explicitProtocol || inferredProtocol || defaultProtocol
+  const defaultProtocolOptionLabel = inferredProtocol && inferredProtocol !== defaultProtocol
+    ? t('自动匹配（{protocol}）', { protocol: customSource.customProtocolLabel(inferredProtocol) })
+    : t('跟随提供商默认（{protocol}）', { protocol: customSource.customProtocolLabel(defaultProtocol) })
+  const endpointPreview = isCustomProvider
+    ? customSource.previewCustomEndpointUrl(providerRecord?.baseUrl, effectiveProtocol, providerRecord?.urlSuffix)
+    : ''
   const duplicateError = id.trim() ? addModelError(providerValue, id.trim()) : ''
 
   async function save(): Promise<void> {
@@ -312,7 +325,7 @@ export function CustomModelDialog({ initial, onClose }: { initial: CustomModelCo
     setSaving(true)
     setStatus(t('保存中…'))
     try {
-      const next = await writeAddModel(providerValue, value)
+      const next = await writeAddModel(providerValue, value, explicitProtocol)
       accept(next)
       setSaving(false)
       onClose()
@@ -355,17 +368,10 @@ export function CustomModelDialog({ initial, onClose }: { initial: CustomModelCo
         <DialogBody>
           <div className='flex flex-col gap-1.5'>
             <Label htmlFor='custom-model-provider'>{t('提供商')}</Label>
-            <Select value={providerValue} disabled={initial.locked}
-              onValueChange={next => setProvider(String(next))}>
-              <SelectTrigger id='custom-model-provider' className='w-full'>
-                <SelectValue>{providerLabel}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {choices.map(item => (
-                  <SelectItem key={item.id} value={item.id}>{item.label}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <SearchableSelect value={providerValue} disabled={initial.locked} onValueChange={setProvider}
+              id='custom-model-provider' className='w-full' displayValue={providerLabel}
+              aria-label={t('提供商')} searchPlaceholder={t('搜索提供商')}
+              options={choices.map(item => ({ value: item.id, label: item.label }))} />
           </div>
           <div className='flex flex-col gap-1.5'>
             <Label htmlFor='custom-model-id'>{t('上游模型 ID')}</Label>
@@ -373,9 +379,36 @@ export function CustomModelDialog({ initial, onClose }: { initial: CustomModelCo
               autoComplete='off' spellCheck={false} autoFocus value={id}
               onChange={event => setId(event.currentTarget.value)} onKeyDown={onEnter} />
           </div>
+          {isCustomProvider ? (
+            <div className='flex flex-col gap-1.5'>
+              <Label htmlFor='custom-model-protocol'>{t('请求协议')}</Label>
+              <Select value={protocol} onValueChange={next => setProtocol(String(next))}>
+                <SelectTrigger id='custom-model-protocol' className='w-full'>
+                  <SelectValue>
+                    {explicitProtocol
+                      ? customSource.customProtocolLabel(explicitProtocol)
+                      : defaultProtocolOptionLabel}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value='__default__'>{defaultProtocolOptionLabel}</SelectItem>
+                  {customSource.CUSTOM_PROTOCOL_OPTIONS.map(option => (
+                    <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          ) : null}
           <div className='rounded-md border border-border bg-surface-inset px-3 py-2.5 font-mono text-[12px] text-subtle'>
-            {t('在 ')}<b className='text-primary-fg'>{providerLabel}</b>{t(' 上登记上游模型')}{' '}
-            <b className='text-primary-fg'>{id.trim() || t('<上游模型 ID>')}</b>{t('（登记后即可用这个名字请求）')}
+            <div>
+              {t('在 ')}<b className='text-primary-fg'>{providerLabel}</b>{t(' 上登记上游模型')}{' '}
+              <b className='text-primary-fg'>{id.trim() || t('<上游模型 ID>')}</b>{t('（登记后即可用这个名字请求）')}
+            </div>
+            {endpointPreview ? (
+              <div className='mt-1 break-all text-[11.5px]'>
+                {t('请求地址：')}<b className='text-primary-fg'>{endpointPreview}</b>
+              </div>
+            ) : null}
           </div>
           <p className='text-xs leading-[1.65] text-subtle'>
             {t('填上游真正认识的那个模型 ID（不是给下游用的名字）。登记后它会进入该家的模型清单： 表格里出现这一行、')}<code>/v1/models</code>{t(' 会广告它、请求它也会被转发到这家。 支持字母、数字与 ')}<code>- _ . / :</code>{t('。')}

@@ -42,6 +42,7 @@ impl AccountPlan {
                 account.at <= now
                     && account.attempted_at.is_none()
                     && crate::server::core::plugin_host::serves_provider(&account.provider)
+                    && !crate::server::core::plugin_host::operations::active_for_provider(&account.provider)
             })
             .map(|(id, account)| (account.at, id.clone()))
             .collect();
@@ -61,6 +62,7 @@ impl AccountPlan {
             .filter(|account| {
                 account.attempted_at.is_none()
                     && crate::server::core::plugin_host::serves_provider(&account.provider)
+                    && !crate::server::core::plugin_host::operations::active_for_provider(&account.provider)
             })
             .map(|account| account.at)
             .min()
@@ -107,13 +109,19 @@ pub fn prepare(
         let Some(&(start, end)) = windows.get(provider) else {
             continue;
         };
+        if let Some(until) = account.get("dailyCheckin")
+            .and_then(crate::server::core::account_store::checkin_state::rolling_until)
+        {
+            let existing = plan.accounts.get(id);
+            let at = until.max(start);
+            let attempted_at = existing.filter(|existing| existing.provider == provider)
+                .and_then(|existing| existing.attempted_at).filter(|attempted| *attempted >= until);
+            plan.accounts.insert(id.to_string(), PlannedAccount { provider: provider.into(), at, attempted_at });
+            continue;
+        }
         let completed = (schedule.account_plan.date != date
             && times::main_fired(schedule, provider, &date))
-            || account
-                .get("checkinAt")
-                .and_then(Value::as_i64)
-                .and_then(beijing::date_key_of_ms)
-                .is_some_and(|key| key == date);
+            || crate::server::core::account_store::checkin_state::checked_in_today(account);
         if let Some(existing) = plan.accounts.get_mut(id) {
             if existing.provider == provider {
                 if completed && existing.attempted_at.is_none() {
@@ -195,6 +203,7 @@ pub fn take_due(id: &str, account_id: &str, date: &str) -> Option<String> {
             || account.at > now.timestamp_millis()
             || !schedule.providers.contains(&account.provider)
             || !crate::server::core::plugin_host::serves_provider(&account.provider)
+            || crate::server::core::plugin_host::operations::active_for_provider(&account.provider)
             || schedule
                 .account_plan
                 .windows

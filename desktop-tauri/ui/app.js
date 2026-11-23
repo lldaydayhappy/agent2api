@@ -145,19 +145,19 @@ const PAGES = ['assistant', 'overview', 'accounts', 'checkin', 'routing', 'gatew
  *
  *  `checkin` 是**内置页**（见 index.html 的说明）：页面归网关，签到能力归插件。 */
 const PAGE_LABELS = {
-  assistant: wbI18n.t('AI 助手'),
+  assistant: wbI18n.t('对话'),
   overview: wbI18n.t('报表'),
   accounts: wbI18n.t('账号'),
   checkin: wbI18n.t('签到中心'),
   routing: wbI18n.t('路由'),
   gateway: wbI18n.t('模型管理'),
   agent: wbI18n.t('Agent 配置'),
-  tools: wbI18n.t('工具服务'),
+  tools: wbI18n.t('MCP & Skills'),
   proxies: wbI18n.t('网络代理'),
   keys: wbI18n.t('网关 Key'),
   docs: wbI18n.t('文档'),
   logs: wbI18n.t('日志'),
-  tasks: wbI18n.t('定时任务'),
+  tasks: wbI18n.t('自动维护'),
   requests: wbI18n.t('请求日志'),
   plugins: wbI18n.t('插件'),
   settings: wbI18n.t('设置'),
@@ -242,6 +242,7 @@ function adoptPluginPages(data) {
   // 交给侧边栏模型（它负责「新菜单补进哪一组」与落盘校验）
   window.wbSidebarLayout?.setDynamicMenus?.([...pluginPages.values()]);
   renderSidebar();
+  window.wbCheckin?.invalidate?.();
   // 当前正停在某个插件页、而它刚被卸载：退回默认页，别让用户对着一块空白
   if (currentPage.startsWith(PLUGIN_PAGE_PREFIX) && !pluginPages.has(currentPage)) {
     showPage('overview', { persist: false });
@@ -256,6 +257,7 @@ function adoptPluginPages(data) {
  */
 async function refreshPluginPages(payload) {
   if (payload) {
+    window.wbCheckin?.invalidate?.();
     adoptPluginPages(payload);
     return;
   }
@@ -386,6 +388,7 @@ function showPluginPage(key, { persist = true } = {}) {
   if (crumb) crumb.textContent = page.label;
   window.wbShell?.closeNavigation();
   if (persist) localStorage.setItem(PAGE_KEY, key);
+  window.dispatchEvent(new CustomEvent('wb:page', { detail: key }));
   window.wbColSettings?.close?.();
   // 整块换掉：上一页的 iframe 连同它的定时器一起消失
   host.innerHTML = '';
@@ -496,7 +499,7 @@ function onPluginMessage(event) {
 }
 window.addEventListener('message', onPluginMessage);
 
-function showPage(name, { persist = true } = {}) {
+function showPage(name, { persist = true, checkUpdate = false } = {}) {
   // 插件页走单独一条路：它不是 `<section class="page" data-page>` 里的内置页，
   // 而是一个 iframe（页面由插件包提供、网关托管，见 adoptPluginPages）。
   if (typeof name === 'string' && name.startsWith(PLUGIN_PAGE_PREFIX) && pluginPages.has(name)) {
@@ -552,18 +555,18 @@ function showPage(name, { persist = true } = {}) {
     clearRequestsBadge();
     window.wbRequestsPanel?.load?.();
   }
-  // 定时任务页自持清单与编辑态，切进去时拉一次最新
+  // 自动维护自持执行记录与编辑态，切进去时拉一次最新。
   if (page === 'tasks') {
     window.wbTasksPanel?.load?.();
   }
   if (page === 'settings') {
-    window.wbSettingsPanel?.load?.();
+    void window.wbSettingsPanel?.load?.({ checkUpdate });
   }
   // 切到签到中心时重拉一次快照：用户可能刚在账号页加/删了账号，或者刚在
   // 「插件」页装完插件（签到能力正是从那儿来的）。页面岛自己也会在首次挂载时
   // 拉一次，但那是「进程内第一次」—— 之后每次切进来都要刷新。
   if (page === 'checkin') {
-    window.wbCheckin?.load?.();
+    (window.wbCheckin?.enter || window.wbCheckin?.load)?.();
   }
   // 提供商插件页自持包列表与宿主状态，切进去时拉一次最新（用户可能刚在
   // 另一个窗口里手工换过包，或者宿主崩溃重启过）
@@ -591,18 +594,6 @@ function showPage(name, { persist = true } = {}) {
     window.wbProxiesPanel?.activate?.();
     void window.wbProxiesPanel?.load?.();
   }
-  // 切到账号页时立刻补一次连接数：那条 2 秒轮询只在「当时就在账号页」时才发请求，
-  // 切走的这段时间里缓存已经过期，不补一下会先看到几秒前的旧数字
-  if (page === 'accounts') {
-    void window.wbAccountsView?.refreshList?.();
-    void window.wbAccountsView?.syncConnections?.();
-    // 余额快照只在账号页可见时拉：隐藏页 / 启动首屏若不在账号页，不该为它多打一发。
-    // 20 秒轮询里也按同一个判据（见文件末尾的 setInterval）。
-    void window.wbAccountsView?.syncBalancesSnapshot?.();
-    // 代理列的下拉读的是与「网络代理」页共用的那份池缓存：那一页的写操作会就地
-    // 更新它，但池也可能在应用外被改过（另一个窗口 / 手工改库），切回来时重读一次
-    void window.wbAccountsView?.refreshProxyPool?.();
-  }
   // 网关 Key 页持有数据，切进去时拉一次最新（模型管理页在上面已经拉过）
   if (page === 'keys') {
     window.wbKeysPanel?.load?.();
@@ -628,11 +619,12 @@ function showPage(name, { persist = true } = {}) {
 function renderTopbarStatus() {
   const session = state?.session || {};
   const accounts = state?.accounts?.accounts || [];
-  const enabled = accounts.filter(account => account.enabled !== false).length;
-  const available = accounts.filter(account => account.enabled !== false && account.available !== false).length;
+  const summary = state?.accounts?.summary;
+  const enabled = summary?.enabled ?? accounts.filter(account => account.enabled !== false).length;
+  const available = summary?.available ?? accounts.filter(account => account.enabled !== false && account.available !== false).length;
   const modelApi = window.wbAccountsModel;
   const isLimited = modelApi?.isLimited || modelApi?.isRateLimited;
-  const limited = isLimited ? accounts.filter(account => account.enabled !== false && isLimited(account)).length : 0;
+  const limited = summary?.limited ?? (isLimited ? accounts.filter(account => account.enabled !== false && isLimited(account)).length : 0);
   const ready = window.wbPortPanel?.isReady?.() === true;
   const port = window.wbPortPanel?.portLabel?.() || "";
   const chip = (text, kind = "", optional = false) => ({ text, kind, optional, dot: true });
@@ -650,7 +642,7 @@ function renderTopbarStatus() {
     docs: () => [gateway(), chip(port, "", true)],
     logs: () => mirror("logs-badge"),
     requests: () => mirror("req-badge"),
-    tasks: () => mirror("tasks-badge"),
+    tasks: () => [gateway(true)],
     settings: () => [gateway(true), ...(enabled ? [chip(wbI18n.t("{n} 个账号启用", { n: enabled }))] : [])],
     overview: () => [gateway(), available ? chip(wbI18n.t("{n} 个账号可用", { n: available }), "ok") : chip(session.loggedIn ? wbI18n.t("已登录") : wbI18n.t("未登录"), session.loggedIn ? "ok" : "warn")],
   };
@@ -909,6 +901,7 @@ async function syncRequestsBadge() {
       status: 'error',
       start: lastSeenReqTs,
       limit: 1,
+      view: 'list',
     });
     // 等待期间进了请求日志页：这次结果已过期，别拿旧数把刚清掉的角标又点亮
     if (currentPage === 'requests') return;
@@ -933,7 +926,7 @@ async function syncRunningRequests() {
   if (currentPage === 'requests') return;
   runningQueryBusy = true;
   try {
-    const result = await api.getStatsRequests({ status: 'running', limit: 1 });
+    const result = await api.getStatsRequests({ status: 'running', limit: 1, view: 'list' });
     runningRequests = Number(result?.matched) || 0;
   } catch {
     return; // 保持上一次的显示：查询偶尔失败不该反过来抹掉已有提示
@@ -1085,6 +1078,35 @@ function releaseBusy() {
   busy = false;
 }
 
+function applyAccounts(next, redraw = true) {
+  if (!next || !Array.isArray(next.accounts)) return false;
+  const previous = state?.accounts;
+  const compare = snapshot => {
+    if (!snapshot) return '';
+    const { sorting, ...fields } = snapshot;
+    const { updatedAt: _updatedAt, ...order } = sorting || {};
+    return JSON.stringify({ ...fields, sorting: order });
+  };
+  if (compare(previous) === compare(next)) return false;
+  const saved = new Map((previous?.accounts || []).map(account => [account.id, account]));
+  const accounts = next.accounts.map(account => {
+    const old = saved.get(account.id);
+    return old && JSON.stringify(old) === JSON.stringify(account) ? old : account;
+  });
+  state = { ...state, accounts: { ...next, accounts } };
+  for (const key of ['accountFeatures', 'providerIcons', 'desktopLaunch']) {
+    if (Object.prototype.hasOwnProperty.call(next, key)) state[key] = next[key];
+  }
+  window.wbAccountsView?.refreshCaches(new Set(accounts.map(account => account.id)));
+  window.wbCheckin?.invalidate?.();
+  if (redraw) {
+    renderAccountsView();
+    renderTopbarStatus();
+    publishRefreshStatus({ error: '' });
+  }
+  return true;
+}
+
 // 在途请求可能早于插件操作；后来的刷新必须补读，不能复用那份旧响应。
 function refresh({ force = true } = {}) {
   if (refreshTask && !force) return refreshTask;
@@ -1102,12 +1124,24 @@ function refresh({ force = true } = {}) {
           throw new Error(wbI18n.t('账号列表响应异常'));
         }
         if (completed !== refreshRequested) continue;
-        state = next;
+        const previousState = state;
+        const previousAccounts = state?.accounts;
+        applyAccounts(next.accounts, false);
+        const accounts = state.accounts;
+        state = { ...next, accounts };
+        if (previousState && (previousState.pluginStartup !== next.pluginStartup
+          && JSON.stringify(previousState.pluginStartup) !== JSON.stringify(next.pluginStartup)
+          || JSON.stringify(previousState.providerIcons) !== JSON.stringify(next.providerIcons))) {
+          window.wbCheckin?.invalidate?.();
+        }
         stateError = '';
-        const validIds = new Set(state.accounts.accounts.map(account => account.id));
+        const validIds = new Set(accounts.accounts.map(account => account.id));
         window.wbAccountsView?.refreshCaches(validIds);
-        window.wbAccountPanel?.invalidate();
-        render();
+        renderGateway();
+        renderModels();
+        renderProxyStatus();
+        renderTopbarStatus();
+        if (accounts !== previousAccounts) renderAccountsView();
         publishRefreshStatus({ error: '' });
         applied = true;
       } catch (error) {
@@ -1145,11 +1179,12 @@ async function runAccountAction(action, id) {
         ? wbI18n.t('账号已在全局队列第一位')
         : wbI18n.t('✅ 已将账号优先级调整到全局第一位'));
     } else if (action === 'refresh') {
+      const account = window.wbAccountsView?.findAccount?.(id) || state?.accounts?.accounts?.find(a => a.id === id);
       await api.refreshAccountToken(id);
       await refresh();
-      toast(wbI18n.t('✅ Token 已刷新'));
+      toast(account?.canSyncCredentials === true ? wbI18n.t('✅ 登录态已刷新') : wbI18n.t('✅ Token 已刷新'));
     } else if (action === 'remove') {
-      const account = state?.accounts?.accounts?.find(a => a.id === id);
+      const account = window.wbAccountsView?.findAccount?.(id) || state?.accounts?.accounts?.find(a => a.id === id);
       // 与岛内 displayNameOf 同一口径：nameCustom 恒赢，未打标维持旧口径（昵称优先）
       const name = esc(account?.nameCustom && account?.name ? account.name : (account?.nickname || account?.name || id));
       // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认），
@@ -1166,7 +1201,9 @@ async function runAccountAction(action, id) {
       toast(wbI18n.t('账号已删除'));
     }
   } catch (error) {
-    toast(wbI18n.t('操作失败：{message}', { message: error.message }), 'err');
+    const message = typeof window.wbAccountsView?.refreshFailureMessage === 'function'
+      ? window.wbAccountsView.refreshFailureMessage(error.message) : wbI18n.t(error.message);
+    toast(wbI18n.t('操作失败：{message}', { message }), 'err');
   } finally {
     releaseBusy();
   }
@@ -1228,8 +1265,8 @@ window.addEventListener('wb:sidebar-layout', () => {
 
 api.onStateChanged(next => {
   if (!next?.accounts && !next?.session && !next?.health) return;
-  // 事件快照可能早于插件操作，只作失效通知；最新状态仍经统一刷新读取。
-  void refresh();
+  // 账号页由实时通知负责补读；其他页面仍使用共享状态刷新。
+  if (currentPage !== 'accounts') void refresh();
 });
 
 // ─── 共享给子模块（账号视图 / 词表面板 / 日志面板 / 账号设置面板）───
@@ -1242,6 +1279,7 @@ window.wbApp = {
   getState: () => state,
   runAccountAction,
   refresh,
+  applyAccounts,
   getRefreshStatus: () => refreshStatus,
   subscribeRefresh,
   // 插件页清单重拉（插件页装 / 卸 / 启停之后由插件页的岛调它）：
@@ -1294,14 +1332,21 @@ function restoredPage() {
   return api.firstVisibleKey(layout) || saved;
 }
 const initialPage = restoredPage();
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => {
-    showPage(initialPage, { persist: false });
-    restorePortPanel();
-  }, { once: true });
-} else {
-  showPage(initialPage, { persist: false });
+async function restoreInitialPage() {
+  let checkUpdate = false;
+  // 先处理托盘意图，避免轻量模式重建时恢复旧更新页、顺带启动遗留安装包。
+  if (api.takeTrayUpdateCheck) {
+    try { checkUpdate = await api.takeTrayUpdateCheck(); }
+    catch (error) { console.warn('读取托盘更新请求失败:', error); }
+  }
+  showPage(checkUpdate ? 'settings' : initialPage, { persist: false, checkUpdate });
   restorePortPanel();
+  window.dispatchEvent(new Event('wb:app-ready'));
+}
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => { void restoreInitialPage(); }, { once: true });
+} else {
+  void restoreInitialPage();
 }
 
 refresh();
@@ -1360,16 +1405,8 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 }, { once: true });
 
-// 窗口重新可见时立刻补读一次余额快照：20 秒轮询在页面隐藏期间整体跳过
-// （见下面 setInterval 的 document.hidden 判定），恢复可见的瞬间界面上还是
-// 隐藏前的旧读数 —— 这一下让用户切回来就看到定时任务的最近一轮结果。
-// 快照时间戳没变时 syncBalancesSnapshot 自己会早退，重复触发没有代价。
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) return;
-  if (currentPage === 'accounts') {
-    void window.wbAccountsView?.refreshList?.();
-    void window.wbAccountsView?.syncBalancesSnapshot?.();
-  }
   if (api.platform !== 'web') {
     const frame = pluginPageHost()?.querySelector('iframe');
     if (frame) void pushPanelToken(frame.contentWindow);
@@ -1382,7 +1419,7 @@ let slowPollTick = 0;
 // 定时轮询：限额标记（429 + 恢复时间）与账号状态变化自动刷新；窗口隐藏时暂停
 setInterval(() => {
   if (document.hidden) return;
-  refresh({ force: false });
+  if (currentPage !== 'accounts') void refresh({ force: false });
   // 后端状态一起轮询：网关可能在这期间起停（端口冲突、用户结束占用进程后重启），
   // 而管理 API 打不通时 refresh() 只会静默失败，看不出发生了什么
   void window.wbPortPanel?.sync?.();
@@ -1391,9 +1428,6 @@ setInterval(() => {
   void syncLogsBadge();
   // 请求日志的未读失败同理：人不在请求日志页时也要有人推进角标
   void syncRequestsBadge();
-  // 余额快照只在账号页可见时读：后端的每账号自动查询在跑，人不在账号页时
-  // 没必要每 20 秒取一次；切回账号页时 showPage 会立刻补一次。
-  if (currentPage === 'accounts') void window.wbAccountsView?.syncBalancesSnapshot?.();
   // 侧边栏布局是跨设备同步，变化频率远低于 20 秒；每 3 轮（60 秒）对一次库。
   // 内容没变时 `syncFromServer` 自己早退，不会重画（重画会打断正在拖动的项）。
   slowPollTick = (slowPollTick + 1) % 3;

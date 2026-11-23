@@ -4,9 +4,9 @@
 //! ── 内部分层（拆开是为了每片都保持单一职责、单文件不过长）─────
 //! ```text
 //! server/
-//!   request_stats.rs     存储本体：记账（进行中行 → 在途回写 → 终态收尾）/
-//!                        查询 / 读取（本文件）
+//!   request_stats.rs     存储句柄、查询与读取
 //!   request_stats/
+//!     writer.rs   请求开始、在途回写、终态与限额记账
 //!     sql.rs      行级 SQL：明细的读写删裁 + 跨表共用的 FilterPlan（原始 SQL 唯一
 //!                 出现的地方之一；另一处是 daily.rs 与杂项子模块各自的语句）
 //!     daily.rs    行级 SQL：`request_daily` 聚合表的编解码与读-改-写
@@ -79,6 +79,10 @@ mod record;
 // 模块内部各函数仍应是 `pub(super)`：只有 `request_stats.rs` 能调到它们，
 // 对外暴露面收敛在这一层。
 mod report;
+mod cache_report;
+mod counts;
+mod filters_cache;
+mod model_recency;
 mod routing;
 mod trace;
 mod flow;
@@ -88,7 +92,11 @@ mod source;
 mod source_report;
 mod source_backfill;
 mod lifecycle;
+mod writer;
+pub(crate) use writer::LimiterEvent;
 mod sql;
+#[cfg(test)]
+mod tests;
 
 pub use source::{ApiKeyIdentity, RequestSource};
 pub fn request_date_bounds(start: NaiveDate, end: NaiveDate) -> Option<(i64, i64)> {
@@ -111,8 +119,11 @@ use retention::RetentionBounds;
 pub use retention::Retention;
 // 拆到子模块的三样，这里引回：record / usage_summary 的折算入口、
 // remap 的库操作体、报表装配（均为 `pub(super)`，见 aggregate.rs 的模块头）
-use aggregate::{fold_into_daily, remap_model_days, summarize};
-use report::{entry_json, provider_label, CACHE_WINDOWS};
+use aggregate::{
+    compute_day_reprice, fold_into_daily, mark_pricing_backfilled, pricing_candidate_days,
+    read_day_for_reprice, remap_model_days, summarize, write_day_reprice,
+};
+use report::{entry_json, list_entry_json, provider_label, CACHE_WINDOWS};
 
 // CompactStart 在此 re-export：api::stats_api 的 compact 路由按它分派响应。
 // VacuumStatus 只在本模块内（字段类型 / maintenance 的方法）可见。
@@ -219,6 +230,9 @@ pub struct RequestStats {
     maintenance_writes: AtomicU64,
     /// 上次做保留期裁剪的毫秒时间戳；低流量时用它兜底。
     last_maintenance_ms: AtomicI64,
+    model_recency: Arc<model_recency::ModelRecency>,
+    counts: counts::CountsCache,
+    filters_cache: filters_cache::FilterOptionsCache,
 }
 
 impl RequestStats {
@@ -258,6 +272,9 @@ impl RequestStats {
             vacuum: Arc::new(VacuumStatus::new()),
             maintenance_writes: AtomicU64::new(0),
             last_maintenance_ms: AtomicI64::new(0),
+            model_recency: Arc::new(model_recency::ModelRecency::default()),
+            counts: counts::CountsCache::default(),
+            filters_cache: filters_cache::FilterOptionsCache::new(),
         }
     }
 
@@ -364,210 +381,6 @@ impl RequestStats {
         RetentionBounds::of(self.retention())
     }
 
-    /// 记一条请求：插一条明细 + 更新当天聚合（**一个事务**）。
-    ///
-    /// ── 与旧「内存累加」的语义等价性 ────────────────────────────
-    /// 旧实现是「`insert_sorted` 进内存数组 + `guard.daily.entry(...).or_insert(...)`
-    /// 累加 + 按需落盘」；现在是「`INSERT` 一行 + 读出当天聚合行、`fold_into_daily`
-    /// 累加、整行 UPSERT」。三条性质逐一对应：
-    ///   - **累加口径**：`fold_into_daily` 一个字都没改，总量与三个维度仍由它
-    ///     一处推进（这是「各维之和 = 当天总量」的保证，见该函数的说明）；
-    ///   - **顺序**：`ORDER BY ts, row_id` 与旧的「按 ts 升序的数组」同序，
-    ///     同 ts 的条目按写入先后（`row_id` 递增）—— 与 `insert_sorted` 的
-    ///     「同毫秒先到的在前」逐位一致；
-    ///   - **可见性**：旧实现在同一次持锁里完成「进内存 + 落盘」，所以并发的
-    ///     读取方要么看到整条记录、要么完全看不到；这里对应事务的原子提交，
-    ///     提交前别的事务读不到这条明细，也不会读到「明细进了、聚合没进」的中间态
-    ///     （那是旧实现两次独立写盘时会留下的错位）。
-    ///
-    /// ── 「先 UPDATE 后 INSERT」（本次改造：进行中行的收尾）───────
-    /// 转发开始前 `record_started` 已经插了一条 status=0 的行；本方法是它的
-    /// **终态收尾**：先按 `id + status=0` UPDATE 补全全部终态字段（row_id 与
-    /// 「进行中」期间在页面上占的位置都保持不变），UPDATE 影响 0 行再 INSERT ——
-    /// 转发前就失败等没有 started 行的路径维持原有行为。为什么不用唯一索引 +
-    /// UPSERT：存量数据 id 可能重复、不能假设唯一，论证见
-    /// `sql::update_running_request`。两条路径都会走到下面的聚合折算 ——
-    /// 「进行中行不折算、终态统一折算一次」，日报口径与改造前等价。
-    ///
-    /// ── 库存不可用时不报错、不抛错 ──────────────────────────────
-    /// 记账在请求收尾路径上（`api::chat` 的 `record_entry`），它的失败**不能**
-    /// 影响已经转发成功的请求：丢一条统计只是报表少一个数。
-    pub fn record(&self, entry: NewRequestEntry) {
-        let record = entry.normalize();
-        let bounds = self.retention_bounds();
-        let maintain = self.should_maintain();
-        let guard = self.guard();
-        let _ = self.with_conn_mut(&guard, |conn| {
-            let tx = conn.transaction()?;
-            if !record.id.is_empty() && sql::terminal_record_exists(&tx, &record.id)? {
-                return tx.commit();
-            }
-            // 先补全进行中行；没有进行中行（影响 0 行）才新插
-            let updated = sql::update_running_request(&tx, &record)?;
-            if updated == 0 {
-                sql::insert_request(&tx, &record)?;
-            }
-            // 长期运行也必须同时遵守保留天数与数量上限。按批做，见
-            // `MAINTENANCE_EVERY` 的说明 —— 每条请求一次全表 COUNT 太贵。
-            if maintain {
-                sql::delete_expired_requests(&tx, bounds.requests_ms)?;
-                retention::trim_requests(&tx, bounds.request_count)?;
-            }
-            // 聚合：**读-改-写当天那一行**（为什么不是增量的 UPDATE：见 `sql.rs` 模块头）
-            //
-            // 模型测试的行**不折进聚合**（见 `RequestEntry::is_test`）：明细照记
-            // （请求日志要能看到它、要能对照），但报表回答的是「真实流量长什么样」，
-            // 把人工反复发起的样本混进总量与趋势里会把它读歪。判据只有这一处
-            // 与 `rebuild_day` 那处，两处必须同口径 —— 否则「重算过一天」会让
-            // 那天的数字与重算前对不上。
-            if !record.is_test {
-                lifecycle::add_to_daily(&tx, &record)?;
-            }
-            daily::delete_daily_before(&tx, &bounds.daily_key)?;
-            // request_raw 的**条数上限**（见 `record::MAX_RAW_ROWS`）：原始正文
-            // 是这张库里单行最大的字段（实测平均 168 KB），只限单条体积而不限
-            // 条数时会攒成整库最大的一块。判据是一次 `COUNT(*)`（主键索引上
-            // 零点几毫秒），未超限时到此为止 —— 那条带 `ORDER BY` 的 DELETE
-            // 不跑。
-            //
-            // 为什么挂在 `record` 而不是 `store_raw`：正文的写入是独立于记账的
-            // 一次写（大字段不进记账热路径），而清理需要一个事务。记账这条路径
-            // 每请求都走，顺手裁一次的成本比新开一个事务低。副作用是「关了调试
-            // 模式不再写新正文」时也照样会裁（只要还有请求在跑）—— 这正是想要
-            // 的：旧正文不会因为不再产生新行而永久占着空间。
-            //
-            // 与上面的保留期裁剪同一节拍（`maintain`）：正文条数没有「按天」
-            // 语义，晚 127 条再裁不会影响任何展示。
-            // 两步都**忽略失败**：正文是排障辅助，它这边出任何问题都不该让整条
-            // 记账回滚（回滚的代价是这条请求的明细与日报一起没了）。失败的现场
-            // 只留在控制台（由 `with_conn_mut` 那层打）。
-            if maintain {
-                if let Ok(raw_rows) = sql::count_raw(&tx) {
-                    if raw_rows > MAX_RAW_ROWS {
-                        let _ = sql::trim_raw_rows(&tx, raw_rows - MAX_RAW_ROWS);
-                    }
-                }
-            }
-            tx.commit()
-        });
-    }
-
-    /// 记一条**进行中**的请求（status=0；转发开始前、模型解析成功后调用）。
-    ///
-    /// ── 为什么要有这一步 ────────────────────────────────────────
-    /// 改造前一条明细要等到转发收尾才落库：流式请求在**最后一个字节发完**时
-    /// 才记账（`RecordingStream` 的 settle），于是一条跑了半分钟的请求在这半
-    /// 分钟里对请求日志页完全不可见。进行中行把「这条请求开始了」提前到转发
-    /// 开始那一刻：列表页能看到它（status=0，前端显示为进行中），收尾时由
-    /// `record` 的 UPDATE 把终态字段补全 —— 一次请求仍然恰好一行。
-    ///
-    /// ── 生命周期（started → update → stale 清理）────────────────
-    ///   1. `record_started`：插 status=0 行（只有 id / ts / 模型名）；
-    ///   2. `record`：UPDATE 该行补全终态字段（UPDATE 影响 0 行则说明没有
-    ///      started 行 —— 转发前就失败的路径，走 INSERT，行为同改造前）；
-    ///   3. 若进程崩溃 / 流任务泄漏，行永远停在步骤 1 —— `delete_stale_running`
-    ///      在每次 `record_started` 时顺手把「超过 [`RUNNING_STALE_MS`] 还在
-    ///      进行中」的行删掉（阈值见该常量的说明）。
-    ///
-    /// 进行中行**不进日报**（`fold_into_daily` 按 status=0 跳过）：它没有
-    /// 任何终态值，折算进聚合会让报表凭空多一次请求、而 token 是 0 ——
-    /// 等它收尾时终态行会正常折算，一次也不多、一次也不少。
-    ///
-    /// ── 幂等与降级 ──────────────────────────────────────────────
-    /// 同 id 已有进行中行时跳过（重复调用不产生第二行）；库不可用时静默跳过
-    /// —— 这一步的失败只是「列表里晚一点才看到这条请求」，与统计整体的
-    /// 「少记不影响请求」同一取向。
-    /// ── 来源标记（`is_test`，schema v7）───────────────────────────
-    /// 与 id / ts 同一时刻定稿：它是**入口**（`api::model_test`）才知道的事实，
-    /// 随进行中行一起写下来，于是「进行中」那一段的测试行也一眼可辨。
-    ///
-    /// `client`（来源客户端，schema v12）同理：入口解析请求头后就知道它是谁，
-    /// 随首发写入，进行中行的「客户端」列不必等收尾才显示。
-    pub fn record_started(
-        &self,
-        id: &str,
-        ts: i64,
-        model: &str,
-        client_model: &str,
-        client_reasoning: &str,
-        source: &RequestSource,
-        is_test: bool,
-    ) {
-        if id.is_empty() {
-            return;
-        }
-        let bounds = self.retention_bounds();
-        let maintain = self.should_maintain();
-        let guard = self.guard();
-        let _ = self.with_conn_mut(&guard, |conn| {
-            let tx = conn.transaction()?;
-            sql::insert_started_request(
-                &tx,
-                id,
-                ts,
-                model,
-                client_model,
-                client_reasoning,
-                source,
-                is_test,
-            )?;
-            // 陈旧清理与插入同事务：僵尸行的判定时点与本次开始时点一致，
-            // 中断也只影响「这次有没有清成」，不会留下半删状态
-            lifecycle::finish_stale(&tx, stale_cutoff(), now_ms())?;
-            if maintain {
-                sql::delete_expired_requests(&tx, bounds.requests_ms)?;
-                retention::trim_requests(&tx, bounds.request_count)?;
-            }
-            tx.commit()
-        });
-    }
-
-    /// 收尾上一次运行遗留的进行中行（启动时调一次）。
-    ///
-    /// `record_started` 里那次清理要等第一条请求进来才跑；启动时刻主动扫一遍，
-    /// 界面一打开就不会再看到「上一条卡死的请求」。判定与清理口径完全一致
-    /// （同 `stale_cutoff()` 与 `finish_stale_running`），不引入第二套规则。
-    pub fn sweep_stale_running(&self) {
-        let bounds = self.retention_bounds();
-        let guard = self.guard();
-        let _ = self.with_conn_mut(&guard, |conn| {
-            let tx = conn.transaction()?;
-            lifecycle::finish_stale(&tx, stale_cutoff(), now_ms())?;
-            daily::delete_daily_before(&tx, &bounds.daily_key)?;
-            tx.commit()
-        });
-    }
-
-    /// 回写一条「进行中」行的**在途**字段（转发期间每次状态真的变化时调一次）。
-    ///
-    /// ── 为什么需要它 ────────────────────────────────────────────
-    /// `record_started` 插的那行只有 id / ts / 模型名，而选路与发送体定稿都发生在
-    /// 它**之后** —— 于是整段转发期间列表里那一行的「提供商 / 账号 / 上游模型」
-    /// 都是空的（前端显示成「—」），而这几样其实在请求真正发出去之前就已经确定。
-    /// 改造前 `requests` 表上只有两条写路径：收尾（`record` 的 UPDATE）与僵尸行
-    /// 清理。本方法是第三条：**在途回写**，让进行中行从「只有模型名」变成
-    /// 「谁在承载、转发的是什么、已经试了几轮」。
-    ///
-    /// ── 谁调它、多久调一次 ──────────────────────────────────────
-    /// `api::pipeline::live_row_sink` 生成的钩子，由 `RequestTelemetry` 在**内容
-    /// 真的变了**时调用（同一份状态重复上报只写一次，见 `usage::LiveStamp`）——
-    /// 所以一次请求的写入次数是「状态变化次数」而不是「上报次数」（流式路径每
-    /// 收一帧都会 `note_first_frame`，靠指纹闸挡在库外）。接线在 api 层、telemetry
-    /// 只持有一个闭包：core 不认识存储层（依赖方向见 `core/mod.rs` 的约定）。
-    ///
-    /// ── 幂等与降级 ──────────────────────────────────────────────
-    /// 匹配 `id + status = 0`（与收尾同一条件）：收尾之后打空，在途回写晚到一步
-    /// 不会把终态覆盖回去；同一条请求写多少次都只是覆盖同一行的同几列。库不可用
-    /// 时静默跳过 —— 与 `record_started` 同一取向：少一次在途刷新不影响任何业务，
-    /// 界面退化成「进行中行只有模型名」的既有样子。
-    pub fn update_running(&self, id: &str, progress: &RunningProgress) {
-        if id.is_empty() {
-            return;
-        }
-        let guard = self.guard();
-        let _ = self.with_conn_mut(&guard, |conn| sql::update_running_progress(conn, id, progress));
-    }
-
     /// 仅调试模式开启时保存完整下游正文，读写与明细查询分离。
     /// 按留存条数淘汰旧正文，保存失败不影响请求记账。
     pub fn store_raw(&self, id: &str, ts: i64, request_body: Option<&str>, response_body: Option<&str>) {
@@ -671,10 +484,24 @@ impl RequestStats {
                 if let Some(key) = entry { row["label"] = json!(key.name); }
             }
         }
+        let pricing = crate::server::core::model_pricing::settings();
+        let fx_snap = crate::server::core::model_pricing::fx::current_rate_soon();
+        if let Some(target) = summary.as_object_mut() {
+            target.insert("currency".to_string(), json!(pricing.currency));
+            target.insert("exchangeRate".to_string(), json!(fx_snap.rate));
+            target.insert("fx".to_string(), fx_snap.to_json(now));
+        }
         if let (Some(target), Some(sources)) = (summary.as_object_mut(), sources.as_object()) {
             target.extend(sources.clone());
         }
         summary
+    }
+
+    pub fn today_request_count(&self) -> Value {
+        let date = date_key(today());
+        let guard = self.guard();
+        let requests = self.with_conn(&guard, |conn| daily::request_count(conn, &date)).unwrap_or(0);
+        json!({ "range": "today", "startDate": date, "endDate": date, "overview": { "requests": requests } })
     }
 
     /// 明细查询：倒序（新在前）分页。
@@ -699,66 +526,107 @@ impl RequestStats {
         // limit 夹在 [1, MAX_LIMIT]：前端传 0 或十万都不该让接口躺平
         let limit = filter.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let plan = sql::FilterPlan::of(filter);
+        enum PageRows {
+            Full(Vec<RequestEntry>),
+            List(Vec<record::RequestListRow>),
+        }
         let loaded = {
             let guard = self.guard();
-            self.with_conn(&guard, |conn| {
-                // 三个计数共用一次扫描（见 `sql::counts` 的说明）。
-                let (total, matched, running) = sql::counts(conn, &plan)?;
-                let entries = sql::select_page_desc(conn, &plan, filter.offset, limit)?;
-                Ok((total, matched, running, entries))
+            self.with_conn_mut(&guard, |conn| {
+                let tx = conn.transaction()?;
+                let page_rows = if filter.list_only {
+                    PageRows::List(sql::select_page_list_desc(&tx, &plan, filter.offset, limit)?)
+                } else {
+                    PageRows::Full(sql::select_page_desc(&tx, &plan, filter.offset, limit)?)
+                };
+                let external = tx.pragma_query_value(None, "data_version", |row| row.get(0))?;
+                let version = counts::Version {
+                    requests: self.db.as_ref().map_or(0, Db::request_revision),
+                    database: crate::server::db::query_cache_generation(),
+                    external,
+                };
+                let (total, matched, running) = self.counts.read(&tx, version, &plan)?;
+                tx.commit()?;
+                Ok((total, matched, running, page_rows))
             })
         };
-        let (total, matched, running, entries) = loaded.unwrap_or((0, 0, 0, Vec::new()));
-        // 每行经 `entry_json` 补两个派生字段：`providerLabel`（id → label 的换算；
-        // 换算处与汇总的 providers 数组同一个函数，两处名字必然一致）与
-        // `phaseElapsedMs`（在途行「当前阶段已持续多久」，读取那一刻现算 ——
-        // 理由见那个函数的说明）。汇总是**反序列化回 Value**，不是另一套结构：
-        // 契约字段仍由 record.rs 的 serde 注解决定，这里只加不删
-        let rows: Vec<Value> = entries.iter().map(entry_json).collect();
+        let (total, matched, running, page_rows) = loaded.unwrap_or((0, 0, 0, PageRows::Full(Vec::new())));
+        let pricing = crate::server::core::model_pricing::settings();
+        let fx_snap = crate::server::core::model_pricing::fx::current_rate_soon();
+        let rows: Vec<Value> = match page_rows {
+            PageRows::List(entries) => entries.iter().map(|row| list_entry_json(row, &pricing)).collect(),
+            PageRows::Full(entries) => entries.iter().map(|entry| entry_json(entry, &pricing)).collect(),
+        };
         json!({
             "entries": rows,
             "total": total,
             "matched": matched,
             "running": running,
+            "currency": pricing.currency,
+            "exchangeRate": fx_snap.rate,
         })
     }
 
-    /// 筛选下拉的候选清单：明细里出现过的模型名与 provider（各按出现次数降序）。
-    ///
-    /// 形状 `{models: ["…"], providers: [{id, label}]}` —— provider 带 label 是
-    /// 为了让前端不必维护第二份 id → 展示名映射（与明细行的 `providerLabel`
-    /// 同一个换算函数，见 `report::provider_label`）。
-    ///
-    /// ── 为什么是独立端点而不是塞进列表响应 ──────────────────────
-    /// 候选清单与「这一页显示什么」无关：它只在进页面时拉一次，之后翻页 / 换筛选
-    /// 都不该重算（一次全表 GROUP BY 挂到每个分页请求上，是白烧）。反过来，
-    /// 列表响应里塞一份清单会让每页多背几百个字符串，而消费方一个都用不上。
-    ///
-    /// 降级：库不可用时给空清单（`{models: [], providers: []}`）——
-    /// 前端据此只保留「全部」选项，筛选器退化成不可用但界面不报错；
-    /// 与 `query_requests` 的空表降级同一取向（少一个功能好过整页失败）。
-    pub fn filter_options(&self) -> Value {
+    /// 按 `rowId` 或 `id` (+ 可选 `ts`) 读取单条请求的完整详情（含选路快照 / 尝试明细 / 敏感词 / 识别证据）。
+    pub fn request_detail(&self, row_id: Option<i64>, id: Option<&str>, ts: Option<i64>) -> Option<Value> {
         let loaded = {
             let guard = self.guard();
-            self.with_conn(&guard, |conn| {
-                let (models, providers) = sql::select_filter_options(conn, MAX_FILTER_OPTIONS)?;
-                let sources = sql::source_filter_options(conn, MAX_FILTER_OPTIONS)?;
-                Ok((models, providers, sources))
+            self.with_conn(&guard, |conn| match row_id.filter(|value| *value > 0) {
+                Some(row_id) => sql::select_detail_by_row_id(conn, row_id),
+                None => match id.map(str::trim).filter(|value| !value.is_empty()) {
+                    Some(id) => sql::select_detail_by_id(conn, id, ts),
+                    None => Ok(None),
+                },
             })
-        };
-        let (models, providers, mut sources) = loaded.unwrap_or((Vec::new(), Vec::new(), json!({})));
-        if let Some(clients) = sources["clients"].as_array_mut() {
-            for client in clients {
-                client["label"] = json!(crate::server::core::client::display_name(
-                    client["value"].as_str().unwrap_or(""), client["label"].as_str().unwrap_or(""),
-                ));
-            }
+        }?;
+        let (row_id, entry) = loaded?;
+        let pricing = crate::server::core::model_pricing::settings();
+        let mut value = entry_json(&entry, &pricing);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("rowId".to_string(), json!(row_id));
+            object.insert("detailsLoaded".to_string(), Value::Bool(true));
         }
-        let providers: Vec<Value> = providers
-            .into_iter()
-            .map(|id| json!({ "id": id, "label": provider_label(&id) }))
-            .collect();
-        json!({ "models": models, "providers": providers, "clients": sources["clients"], "apiKeys": sources["apiKeys"] })
+        Some(value)
+    }
+
+    /// 筛选下拉的候选清单：明细里出现过的模型名与 provider（各按出现次数降序）。
+    pub fn filter_options(&self) -> Value {
+        let database = crate::server::db::query_cache_generation();
+        let requests = self.db.as_ref().map_or(0, Db::request_revision);
+        if let Some(cached) = self.filters_cache.read_fast(database, requests) {
+            return cached;
+        }
+        let guard = self.guard();
+        let database = crate::server::db::query_cache_generation();
+        let requests = self.db.as_ref().map_or(0, Db::request_revision);
+        if let Some(cached) = self.filters_cache.read_fast(database, requests) {
+            return cached;
+        }
+        let loaded = self.with_conn(&guard, |conn| {
+            self.filters_cache.read_or_compute(conn, database, requests, MAX_FILTER_OPTIONS, |conn| {
+                let (models, providers) = sql::select_filter_options(conn, MAX_FILTER_OPTIONS)?;
+                let mut sources = sql::source_filter_options(conn, MAX_FILTER_OPTIONS)?;
+                if let Some(clients) = sources["clients"].as_array_mut() {
+                    for client in clients {
+                        client["label"] = json!(crate::server::core::client::display_name(
+                            client["value"].as_str().unwrap_or(""),
+                            client["label"].as_str().unwrap_or(""),
+                        ));
+                    }
+                }
+                let providers: Vec<Value> = providers
+                    .into_iter()
+                    .map(|id| json!({ "id": id, "label": provider_label(&id) }))
+                    .collect();
+                Ok(json!({
+                    "models": models,
+                    "providers": providers,
+                    "clients": sources["clients"],
+                    "apiKeys": sources["apiKeys"],
+                }))
+            })
+        });
+        loaded.unwrap_or_else(|| json!({ "models": [], "providers": [], "clients": [], "apiKeys": [] }))
     }
 
     /// 存储概况（排障与报表页脚用）
@@ -777,13 +645,17 @@ impl RequestStats {
     pub fn prune(&self) {
         let bounds = self.retention_bounds();
         let guard = self.guard();
-        let _ = self.with_conn_mut(&guard, |conn| {
+        let ok = self.with_conn_mut(&guard, |conn| {
             let tx = conn.transaction()?;
             sql::delete_expired_requests(&tx, bounds.requests_ms)?;
             retention::trim_requests(&tx, bounds.request_count)?;
             daily::delete_daily_before(&tx, &bounds.daily_key)?;
             tx.commit()
-        });
+        }).is_some();
+        if ok {
+            self.filters_cache.invalidate();
+            crate::server::core::panel_events::notify_requests();
+        }
         // 显式裁剪（启动 / 改保留期）之后重置节拍：下一次记账从新的一批开始。
         self.maintenance_writes.store(0, Ordering::Relaxed);
         self.last_maintenance_ms.store(now_ms(), Ordering::Relaxed);
@@ -895,18 +767,81 @@ impl RequestStats {
             self.with_conn_mut(&guard, remap_model_days)
         };
         match outcome {
-            Some(changed) if !changed.is_empty() => logging::log(
+            Some(changed) if !changed.is_empty() => {
+                self.filters_cache.invalidate();
+                crate::server::core::panel_events::notify_requests();
+                logging::log(
                 "[Stats]",
                 &format!(
                     "🔁 已按上游真名重算 {} 天的模型用量（此前按请求名 / 映射别名累计）：{}",
                     changed.len(),
                     changed.join("、")
                 ),
-            ),
+            );
+            }
             Some(_) => {}
             // Err（已由 with_conn_mut 打控制台日志）与库不可用都在这一支：
             // 标记没写，下次启动自然再试，订正不会因此丢
             None => {}
+        }
+    }
+
+    pub fn backfill_pricing_once(&self) {
+        self.reprice_days_chunked(true);
+    }
+
+    pub fn reprice_recent_days(&self) {
+        self.reprice_days_chunked(false);
+    }
+
+    fn reprice_days_chunked(&self, only_if_unmarked: bool) {
+        let days = {
+            let guard = self.guard();
+            self.with_conn(&guard, |conn| pricing_candidate_days(conn, only_if_unmarked))
+        };
+        let Some(Some(days)) = days else {
+            return;
+        };
+        let settings = crate::server::core::model_pricing::settings();
+        let mut all_ok = true;
+        let mut any_updated = false;
+        for day in days {
+            let loaded = {
+                let guard = self.guard();
+                self.with_conn(&guard, |conn| read_day_for_reprice(conn, day))
+            };
+            let Some((key, items, aggregate_requests)) = loaded else {
+                all_ok = false;
+                break;
+            };
+            if items.is_empty() {
+                continue;
+            }
+            let (updates, rebuilt) =
+                compute_day_reprice(key, items, aggregate_requests, &settings);
+            if updates.is_empty() && rebuilt.is_none() {
+                continue;
+            }
+            let written = {
+                let guard = self.guard();
+                self.with_conn_mut(&guard, |conn| {
+                    write_day_reprice(conn, &updates, rebuilt.as_ref())
+                })
+            };
+            if written.is_none() {
+                all_ok = false;
+                break;
+            }
+            if rebuilt.is_some() || !updates.is_empty() {
+                any_updated = true;
+            }
+        }
+        if only_if_unmarked && all_ok {
+            let guard = self.guard();
+            let _ = self.with_conn(&guard, mark_pricing_backfilled);
+        }
+        if any_updated || (only_if_unmarked && all_ok) {
+            crate::server::core::panel_events::notify_requests();
         }
     }
 }

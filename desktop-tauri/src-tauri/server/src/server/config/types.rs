@@ -75,14 +75,6 @@ pub const KEY_UPDATE_PROXY: &str = "updateProxy";
 /// beta 版本号必须与 tag 的语义化版本一致，否则无法判断更新先后。
 pub const KEY_UPDATE_BETA: &str = "updateBeta";
 
-/// GitHub 令牌的密文信封（config.json 键，**存的不是明文**）。
-///
-/// 值是 `core::update::token` 用 AES-256-GCM 加密出来的 `enc1:<base64>` 信封，
-/// 明文只进内存、只在拼请求头时用；密钥在库外的密钥文件里（细节见那个
-/// 模块的头注释）。API 只报「有没有、来自哪」，不回显本体。
-/// 环境变量 `GITHUB_TOKEN` 仍是兜底来源（优先级：这个键 > 环境变量）。
-pub const KEY_GITHUB_TOKEN: &str = "githubToken";
-
 /// 调试模式开关（config.json 键）。
 ///
 /// 开启后转发层会把**发给上游的请求头（脱敏）与请求体、上游返回的响应头与
@@ -112,6 +104,11 @@ pub const KEY_SANITIZE_FINGERPRINTS: &str = "sanitizeBlacklistFingerprints";
 /// 转发层逐请求读快照，改完下一个请求立即生效，不重启进程。
 /// 转换实施点见 `core::upstream::payload`（send_body 的角色归一层）。
 pub const KEY_DEVELOPER_ROLE_COMPAT: &str = "developerRoleCompat";
+
+/// 第三方模型回答完自动折叠过程开关，默认关闭。
+/// 仅影响严格识别的 Codex Responses 请求；正常完成的非空回答才补最终阶段。
+/// 报表规则与来源声明不改变此开关的作用范围。
+pub const KEY_THIRD_PARTY_REASONING_COLLAPSE: &str = "thirdPartyReasoningCollapse";
 
 /// **Cline 转发头的逐键覆盖**（config.json 键）。
 ///
@@ -347,6 +344,10 @@ pub struct PromptSettings {
     /// `BTreeMap` 而不是 `HashMap`：界面与接口响应都要有稳定顺序（同一份配置
     /// 每次渲染的行序不同，用户会以为设置被改动过）
     pub providers: BTreeMap<String, ProviderPrompt>,
+    pub rules: Vec<crate::server::core::prompt::rules::CompiledRule>,
+    /// 显式空列表也具有权威性，不能重新启用旧的提供商覆盖。
+    pub rules_configured: bool,
+    pub rules_error: Option<String>,
     /// **网关自带提示词的逐家开关**（`KEY_PROMPT_GATEWAY`）：`false` = 这一家不装，
     /// 不在表里 = 装（默认）。与 `providers` 分开的两点理由见那个键的说明。
     pub gateway: BTreeMap<String, bool>,
@@ -365,6 +366,9 @@ impl Default for PromptSettings {
             source: crate::server::core::prompt::PromptSource::None,
             file_error: None,
             providers: BTreeMap::new(),
+            rules: Vec::new(),
+            rules_configured: false,
+            rules_error: None,
             gateway: BTreeMap::new(),
             gateway_text: BTreeMap::new(),
         }
@@ -487,8 +491,10 @@ pub const KEY_LOGS_AUTO_REFRESH: &str = "logsAutoRefresh";
 pub const KEY_REQUESTS_AUTO_REFRESH: &str = "requestsAutoRefresh";
 /// 报表页自动刷新在 `scheduledTasks` 下的子键（同上）
 pub const KEY_REPORT_AUTO_REFRESH: &str = "reportAutoRefresh";
-/// 软件版本检查在 `scheduledTasks` 下的子键（后端定时向 GitHub 查最新发布版本）
+/// 软件版本检查在 `scheduledTasks` 下的子键（后端定时向官网查最新发布版本）
 pub const KEY_UPDATE_CHECK: &str = "updateCheck";
+/// Magpie 插件清单与更新检查在 `scheduledTasks` 下的子键
+pub const KEY_MAGPIE_PLUGIN_CHECK: &str = "magpiePluginCheck";
 
 /// 凭证维护默认间隔（分钟）：与改造前的硬编码 600 秒一致
 pub const DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES: i64 = 10;
@@ -498,23 +504,22 @@ pub const DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES: i64 = 10;
 /// 上游（见 `providers::workbuddy` 的 `refresh_models`），间隔太密等于给上游
 /// 添无谓的负载。一小时的粒度对「模型清单变了没」这个问题足够。
 pub const DEFAULT_MODEL_REFRESH_MINUTES: i64 = 60;
-/// 两个前端自动刷新的默认间隔（秒）：每秒一次。
-///
-/// 比改造前的硬编码 10 秒密得多，这是有意的：两条任务都只在**对应页面可见时**
-/// 才请求（`document.hidden` 与当前页都判过），离开页面就完全静默，所以
-/// 「密」的代价只落在用户正盯着那一页的时候 —— 而那正是他想要实时的时刻。
-/// 两条接口都是本地读写（一条读日志库、一条查统计库），不出网。
-pub const DEFAULT_LOGS_AUTO_REFRESH_SECONDS: i64 = 1;
-pub const DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS: i64 = 1;
+/// 两个前端自动刷新的默认间隔（秒）：放缓为 5 秒作为兜底/节流节拍；
+/// 日志与请求日志页优先由增量事件驱动按需刷新，空闲期不再每秒轮询数据库。
+pub const DEFAULT_LOGS_AUTO_REFRESH_SECONDS: i64 = 5;
+pub const DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS: i64 = 5;
 pub const DEFAULT_REPORT_AUTO_REFRESH_SECONDS: i64 = 1;
 /// 软件版本检查默认间隔（分钟）：每 20 分钟查一次 GitHub 最新发布。
 ///
-/// 20 分钟 = 3 次/小时，相对匿名限额（60 次/小时，且**按出口 IP 计** —— 同一
-/// 出口下的其它程序共用这份额度）留足余量，又能让新版本的提示在一刻钟量级内
-/// 出现。**这个默认值只影响「没配过间隔」的情形**：已经保存过
+/// 默认软件更新自动检查间隔（分钟）：4 小时。
+///
+/// 更新策略与发布列表改为优先走静态 CDN 后仍保留 4 小时默认轮询（可通过设置界面调整），
+/// 在兼顾版本提示及时性的同时避免频繁后台唤醒与流量消耗。**这个默认值只影响「没配过间隔」的情形**：已经保存过
 /// `scheduledTasks.updateCheck.interval` 的配置按原值跑（`interval_field`
 /// 只在键缺失或越界时才回落到默认），所以调整它不会改写老用户的设置。
-pub const DEFAULT_UPDATE_CHECK_MINUTES: i64 = 20;
+pub const DEFAULT_UPDATE_CHECK_MINUTES: i64 = 240;
+/// Magpie 插件清单与更新检查默认间隔（分钟）：6 小时。
+pub const DEFAULT_MAGPIE_PLUGIN_CHECK_MINUTES: i64 = 360;
 
 /// 间隔型任务的取值范围。上下限分两套（分钟 / 秒），因为两类任务的合理区间
 /// 差着量级：后端维护任务按分钟（1 分钟～1 天），前端刷新按秒（1 秒～10 分钟）。
@@ -550,6 +555,7 @@ pub struct ScheduledSettings {
     pub requests_auto_refresh: IntervalTask,
     pub report_auto_refresh: IntervalTask,
     pub update_check: IntervalTask,
+    pub magpie_plugin_check: IntervalTask,
 }
 
 impl Default for ScheduledSettings {
@@ -578,6 +584,10 @@ impl Default for ScheduledSettings {
             update_check: IntervalTask {
                 enabled: true,
                 interval: DEFAULT_UPDATE_CHECK_MINUTES,
+            },
+            magpie_plugin_check: IntervalTask {
+                enabled: true,
+                interval: DEFAULT_MAGPIE_PLUGIN_CHECK_MINUTES,
             },
         }
     }

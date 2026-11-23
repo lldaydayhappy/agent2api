@@ -16,18 +16,25 @@ import {
   type PageSizeChoice,
 } from './table-shell'
 import { t } from '../i18n'
+import { SearchableSelect } from '../../../ui-shared/searchable-select'
 import { DATE_RANGES, dateRangeQuery, readCustomRange, saveCustomRange, validCustomRange } from '../../../ui-shared/date-range'
 import { Empty } from '@ui'
 import { ALL_CLIENTS, clientFilterValue, LogDateFilters, SourceLogFilters, sourceParams,
   type LogDates, type LogDrilldown, type SourceOption } from './requests/source-filters'
+import { switchDisplayCurrency, updateCachedDisplay, usePricingDisplay } from './model-pricing'
 import { RequestCell, headRow, isOk, isRunning, uniqueRowKeys, providerLabelOf, type RequestEntry, type VisibleColumn } from './requests/request-cells'
 import { getStore as getAccountsStore, subscribe as subscribeAccounts } from './accounts-store'
 import { phaseOf, phaseLabelOf, phaseElapsedText, phaseBadgeHtml, phaseElapsedLineHtml } from './requests/request-phase'
+import { PageAutoRefresh, pageRefreshStore, usePageAutoRefresh } from './page-auto-refresh'
+import { requestDirect } from './assistant-api'
+import { subscribeScopedLiveRefresh, type ScopedRefreshController } from '../../../ui-shared/page-live-refresh'
 
 type RequestQueryResult = {
   entries?: RequestEntry[]; total?: number; matched?: number
 
   running?: number
+  currency?: 'usd' | 'cny'
+  exchangeRate?: number
 }
 
 type ProviderOption = { value: string; label: string }
@@ -41,7 +48,6 @@ type RequestsBridge = {
 
   getStatsRequests(query: string): Promise<RequestQueryResult | null | undefined>
   getStatsRequestFilters(): Promise<FilterOptionsResult | null | undefined>
-  getScheduledTasks(): Promise<{ tasks?: IntervalTask[] } | null | undefined>
 }
 
 type Align = 'left' | 'center' | 'right'
@@ -108,12 +114,11 @@ const COLUMNS: Column[] = [
   { key: 'dur', label: t('用时'), sel: '.req-dur', track: '96px', align: 'right' },
   { key: 'speed', label: t('速度'), sel: '.req-speed', track: '96px', align: 'center', legacyAlign: 'right' },
   { key: 'credit', label: t('积分'), sel: '.req-credit', track: '72px', align: 'center' },
+  { key: 'cost', label: t('费用'), sel: '.req-cost', track: '82px', align: 'right' },
   { key: 'usage', label: t('用量'), sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
   { key: 'error', label: t('错误'), sel: '.req-error-cell', track: 'minmax(0, 1.2fr)' },
   { key: 'detail', label: t('详情'), sel: '.req-detail', track: '60px', align: 'right' },
 ]
-
-const DEFAULT_AUTO_REFRESH_MS = 1_000
 
 const PAGE_SIZES = SERVER_PAGE_SIZES
 
@@ -122,14 +127,15 @@ function numericSize(choice: PageSizeChoice): number {
 }
 
 const RANGE_KEY = 'workbuddy-desktop-logs-requests-range'
+const RANGE_MIGRATED_KEY = 'workbuddy-desktop-logs-requests-range-v2'
 const CUSTOM_RANGE_KEY = 'workbuddy-desktop-requests-custom-range'
 
 const FILTERS_KEY = 'workbuddy-desktop-requests-filters'
 
-const FILTER_OPTIONS_TTL_MS = 30_000
+const FILTER_OPTIONS_TTL_MS = 120_000
 
 const RANGES: readonly string[] = DATE_RANGES
-const DEFAULT_RANGE = 'all'
+const DEFAULT_RANGE = 'today'
 
 const RANGE_LABEL: Record<string, string> = {
   today: t('今天'), yesterday: t('昨天'), 7: t('近 7 天'), 30: t('近 30 天'),
@@ -175,12 +181,6 @@ let filtersTouched = false
 
 let entriesValue: RequestEntry[] = []
 
-let autoRefreshMs = DEFAULT_AUTO_REFRESH_MS
-
-let autoEnabled = true
-
-let autoSynced = false
-
 let polling = false
 
 let seq = 0
@@ -192,7 +192,6 @@ let colTried = false
 
 type PanelHandle = {
   load(options?: LoadOptions): Promise<void>
-  setAuto(next: { ms: number; enabled: boolean }): void
   setFilterOptions(providers: ProviderOption[], models: string[], clients: SourceOption[], apiKeys: SourceOption[]): void
   openFiltered(query: LogDrilldown): void
 
@@ -204,7 +203,15 @@ type LoadOptions = { silent?: boolean; resetPage?: boolean }
 
 function readRange(): string {
   try {
+    const migrated = localStorage.getItem(RANGE_MIGRATED_KEY)
     const saved = localStorage.getItem(RANGE_KEY)
+    if (!migrated) {
+      localStorage.setItem(RANGE_MIGRATED_KEY, '1')
+      if (saved === 'all') {
+        localStorage.setItem(RANGE_KEY, DEFAULT_RANGE)
+        return DEFAULT_RANGE
+      }
+    }
     return saved !== null && RANGES.includes(saved) ? saved : DEFAULT_RANGE
   } catch {
     return DEFAULT_RANGE
@@ -254,6 +261,7 @@ function queryParams(): string {
   const params = filterParams()
   params.set('offset', String(current.offset))
   params.set('limit', String(current.size))
+  params.set('view', 'list')
   return params.toString()
 }
 
@@ -274,34 +282,8 @@ async function refreshFilterOptions(): Promise<void> {
   }
 }
 
-async function syncAutoRefresh(): Promise<void> {
-  if (autoSynced) return
-  try {
-    const list = await shared().workbuddyDesktop?.getScheduledTasks()
-    const task = (list?.tasks || []).find(item => item.id === 'requestsAutoRefresh')
-    applyAutoRefresh(task || null)
-    autoSynced = Array.isArray(list?.tasks)
-  } catch (error) {
-    console.warn('读取请求日志自动刷新间隔失败，按默认 1 秒:', errorMessage(error))
-    applyAutoRefresh(null)
-  }
-}
-
 function applyAutoRefresh(task: IntervalTask | null): void {
-  autoSynced = true
-  const interval = Number(task?.interval)
-  const unit = task?.unit
-  const valid = !!task && typeof task === 'object'
-    && Number.isFinite(interval) && interval > 0
-    && (unit === 'seconds' || unit === 'minutes')
-  if (!valid) {
-    autoEnabled = true
-    autoRefreshMs = DEFAULT_AUTO_REFRESH_MS
-  } else {
-    autoEnabled = task.enabled !== false
-    autoRefreshMs = unit === 'minutes' ? interval * 60_000 : interval * 1000
-  }
-  handle?.setAuto({ ms: autoRefreshMs, enabled: autoEnabled })
+  pageRefreshStore.apply('requestsAutoRefresh', task)
 }
 
 function ensureColumns(): void {
@@ -328,14 +310,14 @@ function visibleColumns(): VisibleColumn[] {
 
 type PanelData = {
   entries: RequestEntry[]; total: number; matched: number; running: number
-
+  loadedAt: number
   loaded: boolean
 
   error: string
 }
 
 const EMPTY_DATA: PanelData = {
-  entries: [], total: 0, matched: 0, running: 0, loaded: false, error: '',
+  entries: [], total: 0, matched: 0, running: 0, loadedAt: 0, loaded: false, error: '',
 }
 
 function emptyText(data: PanelData): string {
@@ -346,6 +328,7 @@ function emptyText(data: PanelData): string {
 
 function RequestsPage() {
   const namesHidden = React.useSyncExternalStore(subscribeAccounts, () => getAccountsStore().namesHidden)
+  const pricing = usePricingDisplay()
   const [data, setData] = React.useState<PanelData>(EMPTY_DATA)
   const [filters, setFilters] = React.useState<Filters>(() => readSavedFilters())
   const [range, setRange] = React.useState<string>(() => current.range)
@@ -353,7 +336,7 @@ function RequestsPage() {
   const [offset, setOffset] = React.useState(0)
 
   const [pageSize, setPageSize] = React.useState<number>(() => current.size)
-  const [auto, setAuto] = React.useState(() => ({ ms: autoRefreshMs, enabled: autoEnabled }))
+  const auto = usePageAutoRefresh('requestsAutoRefresh')
   const [providerOptions, setProviderOptions] = React.useState<ProviderOption[]>([])
   const [modelOptions, setModelOptions] = React.useState<string[]>([])
   const [clientOptions, setClientOptions] = React.useState<SourceOption[]>([])
@@ -367,6 +350,10 @@ function RequestsPage() {
   const pendingScrollRef = React.useRef<number | null>(null)
 
   const afterRedrawRef = React.useRef(false)
+  const loadingRef = React.useRef(0)
+  const loadedOnceRef = React.useRef(false)
+  const liveRef = React.useRef<ScopedRefreshController | null>(null)
+  const [liveNow, setLiveNow] = React.useState(0)
 
   const applyFilters = React.useCallback((patch: Partial<Filters>): Filters => {
     current.filters = { ...current.filters, ...patch }
@@ -401,43 +388,58 @@ function RequestsPage() {
 
   const loadPanel = React.useCallback(async (options: LoadOptions = {}): Promise<void> => {
     const { silent = false, resetPage = false } = options
+    if (!loadedOnceRef.current && loadingRef.current > 0 && !resetPage) return
     if (resetPage) applyOffset(0)
-    void syncAutoRefresh()
     restoreSavedFilters()
-    if (!silent) void refreshFilterOptions()
+    liveRef.current?.markLoaded()
     const token = ++seq
+    loadingRef.current += 1
     try {
       const api = shared().workbuddyDesktop
       if (!api) throw new Error(t('后端桥不可用'))
       const result = await api.getStatsRequests(queryParams())
       if (token !== seq) return
+      if (result?.currency || result?.exchangeRate) {
+        updateCachedDisplay({
+          currency: result.currency,
+          exchangeRate: result.exchangeRate,
+        })
+      }
+      const now = Date.now()
       const next: PanelData = {
         entries: Array.isArray(result?.entries) ? result.entries : [],
         total: Number(result?.total) || 0,
         matched: Number(result?.matched) || 0,
         running: Number(result?.running) || 0,
+        loadedAt: now,
         loaded: true,
         error: '',
       }
+      loadedOnceRef.current = true
       const lastOffset = Math.max(0, (Math.ceil(next.matched / current.size) - 1) * current.size)
       if (current.offset > lastOffset) {
         applyOffset(lastOffset)
         return loadPanel({ silent })
       }
       if (resetPage) pendingScrollRef.current = 0
+      setLiveNow(now)
       paint(next, next.entries)
+      if (!silent) void refreshFilterOptions()
     } catch (error) {
+      if (token !== seq) return
       if (!silent) {
         console.warn('读取请求日志失败:', errorMessage(error))
         paintError(t('读取请求日志失败，详见控制台'))
       }
+    } finally {
+      loadingRef.current -= 1
+      liveRef.current?.markLoaded()
     }
   }, [applyOffset, paint, paintError, restoreSavedFilters])
 
   React.useEffect(() => {
     handle = {
       load: loadPanel,
-      setAuto: next => setAuto(next),
       setFilterOptions: (providers, models, clients, apiKeys) => {
         setProviderOptions(providers); setModelOptions(models); setClientOptions(clients); setApiKeyOptions(apiKeys)
       },
@@ -464,13 +466,13 @@ function RequestsPage() {
       entryOf: tag => {
         const key = tag?.dataset?.reqId || ''
         if (!key) return null
-        return entriesValue.find(item => String(item?.id || '') === key)
+        return entriesValue.find(item => String(item?.id || item?.rowId || item?.ts || '') === key)
+          || entriesValue.find(item => String(item?.id || '') === key)
           || entriesValue.find(item => String(item?.ts || '') === key)
           || null
       },
     })
-    void loadPanel({ silent: true })
-    void refreshFilterOptions()
+    void loadPanel({ silent: true }).finally(() => { void refreshFilterOptions() })
     return () => { handle = null }
   }, [loadPanel, applyFilters, applyRange, applyRunningOnly])
 
@@ -488,15 +490,34 @@ function RequestsPage() {
   }, [headSignature])
 
   React.useEffect(() => {
-    if (!auto.enabled || auto.ms <= 0) return
+    const controller = subscribeScopedLiveRefresh({
+      scope: 'requests',
+      enabled: auto.enabled,
+      intervalMs: auto.ms,
+      isActive: () => !document.hidden && shared().wbApp?.currentPage === 'requests',
+      open: (path, signal) => requestDirect(path, { method: 'GET', signal }),
+      onRefresh: async () => {
+        if (polling || loadingRef.current > 0) return
+        polling = true
+        try { await loadPanel({ silent: true }) } finally { polling = false }
+      },
+      windowEvents: ['wb:page'],
+    })
+    liveRef.current = controller
+    return () => {
+      liveRef.current = null
+      controller.stop()
+    }
+  }, [auto.enabled, auto.ms, loadPanel])
+
+  const hasRunning = data.entries.some(isRunning)
+  React.useEffect(() => {
+    if (!hasRunning) return
     const timer = window.setInterval(() => {
-      if (document.hidden || shared().wbApp?.currentPage !== 'requests') return
-      if (polling) return
-      polling = true
-      void loadPanel({ silent: true }).finally(() => { polling = false })
-    }, auto.ms)
-    return () => { window.clearInterval(timer) }
-  }, [auto, loadPanel])
+      if (!document.hidden && shared().wbApp?.currentPage === 'requests') setLiveNow(Date.now())
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [hasRunning])
 
   React.useLayoutEffect(() => {
     if (afterRedrawRef.current) {
@@ -587,20 +608,34 @@ function RequestsPage() {
   }, [filters.model, modelOptions])
 
   const rowKeys = uniqueRowKeys(data.entries)
-  const rows = data.entries.map((entry, index) => (
-    <div key={rowKeys[index]} className={`req-row${isRunning(entry) ? ' running' : isOk(entry) ? '' : ' failed'}`}>
-      {columns.map(column => <RequestCell key={column.key} entry={entry} column={column} namesHidden={namesHidden} />)}
-    </div>
-  ))
+  const driftMs = hasRunning && data.loadedAt > 0 ? Math.max(0, liveNow - data.loadedAt) : 0
+  const rows = data.entries.map((entry, index) => {
+    const runningRow = isRunning(entry)
+    const displayEntry = runningRow && driftMs > 0 && typeof entry.phaseElapsedMs === 'number'
+      ? { ...entry, phaseElapsedMs: entry.phaseElapsedMs + driftMs }
+      : entry
+    return (
+      <div key={rowKeys[index]} className={`req-row${runningRow ? ' running' : isOk(entry) ? '' : ' failed'}`}>
+        {columns.map(column => <RequestCell key={column.key} entry={displayEntry} column={column} namesHidden={namesHidden} />)}
+      </div>
+    )
+  })
 
   return (
     <Card render={<section />} className='panel'>
+      <PageAutoRefresh id='requestsAutoRefresh' settings={auto} onRefresh={() => loadPanel()} />
       <CardHeader className='panel-head'>
         <h2>{t('请求日志列表')}</h2>
         {}
         <Badge id='req-badge' variant='outline' data-tone=''>{badgeText + liveText}</Badge>
         <span className='panel-sub'>{t('按时间倒序，全量保留')}</span>
         <div className='head-actions'>
+          <SegmentedControl
+            value={pricing.currency}
+            onValueChange={val => { void switchDisplayCurrency(val as 'usd' | 'cny') }}
+            options={[{ value: 'usd', label: 'USD $' }, { value: 'cny', label: 'CNY ¥' }]}
+            aria-label={t('计价货币')}
+          />
           {}
           <Button id='btn-req-clear' variant='destructive'
             onClick={() => { void shared().wbRequestClearModal?.open?.() }}>{t('清理')}</Button>
@@ -617,7 +652,7 @@ function RequestsPage() {
             setDates(next)
             saveCustomRange(CUSTOM_RANGE_KEY, next)
             void loadPanel({ resetPage: true })
-          }} onClear={() => onRangeChange('all')} /> : null}
+          }} onClear={() => onRangeChange(DEFAULT_RANGE)} /> : null}
           {}
           <Select value={filters.status} disabled={runningOnly}
             onValueChange={next => onSelectChange({ status: String(next ?? '') })}>
@@ -634,36 +669,15 @@ function RequestsPage() {
               ))}
             </SelectContent>
           </Select>
-          <Select value={filters.provider}
-            onValueChange={next => onSelectChange({ provider: String(next ?? '') })}>
-            <SelectTrigger id='req-provider' className='min-w-[120px]'
-              title={t('按提供商筛选（只列日志里出现过的）')} aria-label={t('按提供商筛选')}>
-              <SelectValue>
-                {filters.provider
-                  ? (providerSelectOptions.find(item => item.value === filters.provider)?.label || filters.provider)
-                  : ALL_PROVIDER_LABEL}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value=''>{ALL_PROVIDER_LABEL}</SelectItem>
-              {providerSelectOptions.map(option => (
-                <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Select value={filters.model}
-            onValueChange={next => onSelectChange({ model: String(next ?? '') })}>
-            <SelectTrigger id='req-model' className='min-w-[120px]'
-              title={t('按模型筛选（只列日志里出现过的；精确匹配模型名）')} aria-label={t('按模型筛选')}>
-              <SelectValue>{filters.model || ALL_MODEL_LABEL}</SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value=''>{ALL_MODEL_LABEL}</SelectItem>
-              {modelSelectOptions.map(value => (
-                <SelectItem key={value} value={value}>{value}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <SearchableSelect value={filters.provider} onValueChange={provider => onSelectChange({ provider })}
+            id='req-provider' className='min-w-[120px] max-w-[240px]'
+            title={t('按提供商筛选（只列日志里出现过的）')} aria-label={t('按提供商筛选')}
+            searchPlaceholder={t('搜索提供商')} options={[{ value: '', label: ALL_PROVIDER_LABEL }, ...providerSelectOptions]} />
+          <SearchableSelect value={filters.model} onValueChange={model => onSelectChange({ model })}
+            id='req-model' className='min-w-[120px] max-w-[240px]'
+            title={t('按模型筛选（只列日志里出现过的；精确匹配模型名）')} aria-label={t('按模型筛选')}
+            searchPlaceholder={t('搜索模型')}
+            options={[{ value: '', label: ALL_MODEL_LABEL }, ...modelSelectOptions.map(value => ({ value, label: value }))]} />
           <SourceLogFilters filters={filters} clients={clientOptions} apiKeys={apiKeyOptions} onChange={onSelectChange} />
           {}
           <Toggle id='btn-req-running' variant='outline' size='default' pressed={runningOnly}

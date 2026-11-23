@@ -7,6 +7,8 @@ use super::source::{ApiKeyAccum, ApiKeyIdentity, ClientAccum, UsageAccum};
 use super::report::{model_breakdown_json, model_stat_key, push_model_accum, safe_rate};
 
 pub(super) fn request_usage(item: &RequestEntry) -> UsageAccum {
+    let cost_usd = item.cost_usd.filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
+    let unpriced_requests = i64::from(item.has_billable_tokens() && item.cost_usd.is_none());
     UsageAccum {
         requests: 1,
         successful: i64::from(item.is_success()),
@@ -16,6 +18,8 @@ pub(super) fn request_usage(item: &RequestEntry) -> UsageAccum {
         cache_read_tokens: item.cache_read_tokens,
         token_details_requests: 1,
         last_used_at: Some(item.ts),
+        cost_usd,
+        unpriced_requests,
     }
 }
 
@@ -40,7 +44,14 @@ fn merge_key(list: &mut Vec<ApiKeyAccum>, incoming: &ApiKeyAccum) {
             merge_client(&mut item.clients, &client.client, &client.label, &client.usage);
         }
         for model in &incoming.models {
-            push_model_accum(&mut item.models, &model.model, model.tokens, model.requests);
+            push_model_accum(
+                &mut item.models,
+                &model.model,
+                model.tokens,
+                model.requests,
+                model.cost_usd,
+                model.unpriced_requests,
+            );
         }
     } else {
         list.push(incoming.clone());
@@ -49,6 +60,8 @@ fn merge_key(list: &mut Vec<ApiKeyAccum>, incoming: &ApiKeyAccum) {
 
 pub(super) fn fold_sources(day: &mut DailyEntry, item: &RequestEntry) {
     let usage = request_usage(item);
+    let item_cost = usage.cost_usd;
+    let item_unpriced = usage.unpriced_requests;
     let label = item.source.recorded_client_name();
     merge_client(&mut day.client_stats, &item.source.client, label, &usage);
     merge_key(&mut day.api_key_stats, &ApiKeyAccum {
@@ -57,7 +70,10 @@ pub(super) fn fold_sources(day: &mut DailyEntry, item: &RequestEntry) {
         clients: vec![ClientAccum { client: item.source.client.clone(), label: label.into(), usage }],
         models: vec![ModelAccum {
             model: model_stat_key(&item.model, &item.upstream_model).to_string(),
-            requests: 1, tokens: item.total_tokens,
+            requests: 1,
+            tokens: item.total_tokens,
+            cost_usd: item_cost,
+            unpriced_requests: item_unpriced,
         }],
     });
 }
@@ -71,6 +87,7 @@ pub(super) fn client_label(client: &str) -> &str {
         "assistant_images" => "助手图片工具",
         "assistant_title" => "助手标题总结",
         "checkin_keepalive" => "日活保活",
+        "image-generation" => "图片生成 MCP",
         _ => client,
     }
 }
@@ -85,7 +102,7 @@ pub(super) fn key_label(identity: &ApiKeyIdentity) -> String {
     }
 }
 
-fn usage_json(usage: &UsageAccum) -> Value {
+pub(super) fn usage_json(usage: &UsageAccum) -> Value {
     let details = usage.token_details_requests >= usage.requests
         && (usage.tokens == 0 || usage.token_details_requests > 0);
     json!({
@@ -100,6 +117,8 @@ fn usage_json(usage: &UsageAccum) -> Value {
         "cacheRate": if details && usage.prompt_tokens > 0 { Some(safe_rate(usage.cache_read_tokens, usage.prompt_tokens)) } else { None },
         "tokenDetailsComplete": details,
         "lastUsedAt": usage.last_used_at,
+        "costUsd": usage.cost_usd,
+        "unpricedRequests": usage.unpriced_requests,
     })
 }
 
@@ -143,6 +162,8 @@ fn remainder(day: &DailyEntry, usages: impl Iterator<Item = UsageAccum>) -> Usag
         requests: (day.requests - covered.requests).max(0),
         successful: (day.successful - covered.successful).max(0),
         tokens: (day.tokens - covered.tokens).max(0),
+        cost_usd: (day.cost_usd - covered.cost_usd).max(0.0),
+        unpriced_requests: (day.unpriced_requests - covered.unpriced_requests).max(0),
         ..Default::default()
     }
 }
@@ -180,6 +201,8 @@ pub(super) fn source_summary(
             "label": key_label(&item.identity),
             "requests": item.usage.requests,
             "totalTokens": item.usage.tokens,
+            "costUsd": item.usage.cost_usd,
+            "unpricedRequests": item.usage.unpriced_requests,
             "detailsComplete": item.clients.iter().map(|client| client.usage.requests).sum::<i64>() == item.usage.requests,
             "clients": build_clients(&item.clients),
             "models": model_rows(&item.models),
@@ -194,24 +217,47 @@ fn model_rows(models: &[ModelAccum]) -> Vec<Value> {
     rows.into_iter().map(|item| json!({
         "model": item.model, "label": if item.model.is_empty() { "未知模型" } else { &item.model },
         "requests": item.requests, "totalTokens": item.tokens,
+        "costUsd": item.cost_usd, "unpricedRequests": item.unpriced_requests,
     })).collect()
 }
 
 pub(super) fn source_breakdown(day: &DailyEntry) -> (Vec<Value>, Vec<Value>) {
     let (clients, keys) = day_sources(day);
-    let clients = build_clients(&clients).into_iter().map(|row| json!({
-        "id": row["id"], "label": row["label"], "tokens": row["totalTokens"], "requests": row["requests"],
-    })).collect();
-    let keys = build_keys(&keys).into_iter().map(|row| json!({
-        "id": row["filterValue"], "label": row["label"], "tokens": row["totalTokens"], "requests": row["requests"],
-    })).collect();
+    let clients = build_clients(&clients).into_iter().map(|mut row| {
+        row["tokens"] = row["totalTokens"].clone();
+        row
+    }).collect();
+    let keys = build_keys(&keys).into_iter().map(|mut row| {
+        row["id"] = row["filterValue"].clone();
+        row["tokens"] = row["totalTokens"].clone();
+        row
+    }).collect();
     (clients, keys)
+}
+
+pub(super) fn day_usage(day: &DailyEntry) -> UsageAccum {
+    let (clients, _) = day_sources(day);
+    let mut usage = UsageAccum::default();
+    for client in clients { usage.merge(&client.usage); }
+    usage.requests = day.requests;
+    usage.successful = day.successful;
+    usage.tokens = day.tokens;
+    usage.cost_usd = day.cost_usd;
+    usage.unpriced_requests = day.unpriced_requests;
+    usage
 }
 
 pub(super) fn all_model_rows(models: &[ModelAccum]) -> Vec<Value> {
     let mut rows = model_breakdown_json(models);
     for item in models.iter().filter(|item| item.requests > 0 && item.tokens == 0) {
-        rows.push(json!({ "model": item.model, "label": if item.model.is_empty() { "未知模型" } else { &item.model }, "tokens": 0, "requests": item.requests }));
+        rows.push(json!({
+            "model": item.model,
+            "label": if item.model.is_empty() { "未知模型" } else { &item.model },
+            "tokens": 0,
+            "requests": item.requests,
+            "costUsd": item.cost_usd,
+            "unpricedRequests": item.unpriced_requests,
+        }));
     }
     rows
 }

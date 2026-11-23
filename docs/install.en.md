@@ -13,7 +13,7 @@ Every form is managed from the **browser panel** afterwards (accounts, gateway k
 - [Server (Windows / Linux, headless)](#server-windows--linux-headless)
 - [Docker](#docker)
 - [Verification and client setup](#verification-and-client-setup)
-- [LAN access](#lan-access)
+- [Network access](#network-access)
 - [Mobile](#mobile)
 
 ## Which form to pick
@@ -50,7 +50,7 @@ Closing the window minimizes to the tray by default and the gateway keeps forwar
 >
 > **Linux desktop notes**: the tray needs `libayatana-appindicator3` (most desktops ship it; install `libayatana-appindicator3-1` if the tray icon does not appear, then restart). An AppImage needs the executable bit before its first run (`chmod +x`; the app sets it automatically when you pick "Open installer"). Updates: deb goes through the system installer (it asks for your password once), while an AppImage is upgraded by replacing the file.
 >
-> **Desktop differences**: "import desktop login state" for AutoClaw and ChatGLM (智谱清言) is Windows-only (it reads Windows DPAPI ciphertext, so that section is hidden on macOS / Linux); the others (Raccoon / CatPaw / Cline) read plaintext files under `HOME` and work on all three platforms. Tray, launch-at-login, LAN access and web-panel hosting are supported on macOS / Linux too.
+> **Desktop differences**: "import desktop login state" for AutoClaw and ChatGLM (智谱清言) is Windows-only (it reads Windows DPAPI ciphertext, so that section is hidden on macOS / Linux); the others (Raccoon / CatPaw / Cline) read plaintext files under `HOME` and work on all three platforms. Tray, launch-at-login, network access and web-panel hosting are supported on macOS / Linux too.
 
 ## Server (Windows / Linux, headless)
 
@@ -122,7 +122,7 @@ Launch at boot, automatic restart after a crash (`Restart=always`) and graceful 
 >
 > For an older installation, download a new server package containing this feature and run `sudo bash install.sh --upgrade` from that package once. This installs the update helper. Custom service accounts or paths are not overwritten; keep using your existing deployment procedure. Set `AGENT2API_SYSTEMD_UPDATE=0` to hide the panel entry, or disable `agent2api-updater.socket` to disable the helper. `AGENT2API_SELF_UPDATE` remains Docker-only; do not enable it on bare metal.
 >
-> The helper uses a local socket, not a network port. It verifies the release repository through the official index by default. Administrators may set `AGENT2API_UPDATER_REPO=owner/repo` or `HTTPS_PROXY` in `/etc/agent2api/updater.env` to pin a repository or configure a proxy for independent verification. Replacement failures restore the old files. If the new service cannot be confirmed ready, recovery files remain in `/opt/agent2api/.before-update-*` and failure is reported; the database is never rolled back automatically.
+> The helper uses a local socket, not a network port. Release policies and checksums come only from the official website. Set `HTTPS_PROXY` in `/etc/agent2api/updater.env` if independent verification needs a proxy. Replacement failures restore the old files. If the new service cannot be confirmed ready, recovery files remain in `/opt/agent2api/.before-update-*` and failure is reported; the database is never rolled back automatically.
 
 ### After installing
 
@@ -156,6 +156,8 @@ Both the administrator and the gateway key can be preset with environment variab
 On Linux put them in `/etc/agent2api/agent2api.env`; on Windows edit the service registry key `HKLM\SYSTEM\CurrentControlSet\Services\Agent2API\Environment` (`install-service.ps1` writes the basic settings and preserves existing configuration on reruns, changing only settings explicitly supplied as parameters).
 
 > **Accounts cannot be preset**: they need a QR scan / SMS code / pasted credentials, which the upstream protocols decide, so there is no way around it. For bulk deployment, copy a fully configured **data directory** over (the SQLite database and `account.key` live side by side), and the accounts move with it.
+
+**Trae response completeness check (desktop / server / Docker)**: enabled by default. Only when investigating compatibility false positives, set `AGENT2API_TRAE_NO_REQUIRE_TERMINAL=1` in the gateway process environment (`true`, `yes` and `on` are also accepted), then restart the gateway so the plugin inherits the new environment. Disabling it may once again accept partial replies without an upstream completion signal as successful; remove the variable and restart to restore the check. This switch requires the provider plugin package containing this fix.
 
 ## Docker
 
@@ -195,7 +197,8 @@ Environment variables (all optional):
 | `AGENT2API_SELF_UPDATE` | In-container update entry: `1` enabled by default (the panel offers "Download and update"); set `0` to upgrade manually only |
 | `AGENT2API_IMAGE_CACHE_MB` | Upper bound of the in-memory download cache for generated images (MiB, default `128`, range 8–4096). Invalid or out-of-range values fall back to the default |
 | `AGENT2API_IMAGE_COMPRESS_CACHE_MB` | Upper bound of the in-memory cache for compressed session images (MiB, default `128`, range 8–4096, same rules) |
-| `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | Advanced: point update checks/downloads at your own source. The first swaps the repository (defaults to the upstream `aimod-cc/Agent2API`; forks should override it), the second swaps the API root (default `https://api.github.com`, must return a GitHub-shaped release JSON). With a custom source set, the download allowlist additionally admits only **that source's own host** (scheme follows the source: an `http://` source also allows plaintext downloads — for local drills / internal mirrors only) |
+
+Software and plugin updates check versions and download packages only through the [Agent2API website](https://agent2api.dev/downloads). Custom update sources and GitHub accelerators are no longer supported, and no GitHub token is required. Select an outbound proxy for website access in Update settings.
 
 Build from source: clone the repo and run `docker compose up -d --build` (the image contains only the gateway and the panel, no Rust toolchain).
 
@@ -222,7 +225,7 @@ glibc allocator tuning such as `MALLOC_ARENA_MAX=2` only matters for builds **wi
 
 ### In-container updates (optional)
 
-The panel's "Software update" page can download and apply updates from inside the container: it fetches `agent2api-server-linux-<arch>.tar.gz` from the official Release (verifying the `.sha256`), replaces the executable and `ui/`, then exits gracefully so the `restart` policy brings the same container back up. Controlled by `AGENT2API_SELF_UPDATE` (set to `1` in the Dockerfile); set it to `0` to upgrade manually only.
+The panel's Software update page can download and apply updates inside the container. It obtains `agent2api-server-linux-<arch>.tar.gz` from the official website, verifies the SHA-256 published there, replaces the executable and `ui/`, then exits gracefully so the restart policy brings the same container back up. This is controlled by `AGENT2API_SELF_UPDATE` (`1` in the Dockerfile); set it to `0` for manual upgrades only.
 
 The same `agent2api-server-linux-<arch>.tar.gz` is also the installer package for the [Linux server](#linux-systemd): its `agent2api-server` and `ui/` entries are exactly what the update chain reads by name, and it additionally ships `install.sh` / `agent2api.service` / `agent2api.env.example`. The update chain only reads the first two (the rest are discarded — see `selfupdate::extract_bundle`), so one artifact serves both purposes: unpack and replace inside a container, unpack and run `install.sh` on a bare-metal host.
 
@@ -256,11 +259,13 @@ print(resp.choices[0].message.content)
 
 **Pages running in a browser** (a self-built web UI, …) that call this endpoint with `fetch` hit a cross-origin preflight rejection — the gateway does **not** answer CORS by default, so the preflight lands on the API-key check and gets a 401. Two ways out: ① turn on "Security → Gateway CORS" in Settings (origin `*`; with `*` any web page could drive your local gateway, so set a "Gateway Key" too); ② make the page same-origin — serve it from a small local static server that reverse-proxies `/v1` to `127.0.0.1:3065`.
 
-## LAN access
+<a id="lan-access"></a>
 
-By default the gateway only listens on `127.0.0.1`. After turning on "Settings → General → LAN access" it listens on all adapters, and devices on the LAN just point their API base URL at this machine's IP (the UI shows the full address) to share the accounts. For safety, enabling it requires registering a panel administrator first: the management API then demands an admin session or a gateway key, and with no key enabled the forwarding API refuses service too (the enable flow adds a "default" key automatically). The web panel can optionally be exposed to the LAN as well (off by default). Changes take effect after a restart.
+## Network access
 
-The desktop installers (Windows / macOS) already ship the web panel's `ui/` folder: once you turn on "expose the web management panel to the LAN" as well, devices on the LAN can open the same address in a browser to get the management UI — the same interface as the Docker form. **The desktop window itself never goes through web login** (there is no login page in the app): it authenticates with this machine's first gateway key, so flipping that switch never asks you to sign in from the desktop app. The web login page only appears when a browser opens the panel.
+The desktop app listens only on `127.0.0.1` by default. Under "Settings → Gateway → Network access", enable "Allow other devices to access the gateway" to listen on all IPv4 interfaces (`0.0.0.0`). **This does not restrict access to the LAN or automatically expose the gateway to the internet**; actual reachability depends on routing, port forwarding, and firewall settings. The UI displays separate API and web management addresses for this machine. Use an address reachable from the connecting device; the displayed address does not guarantee public internet access. A panel administrator must be registered first. Management endpoints require an admin session or gateway key; API calls require an enabled gateway key, with a default key created automatically if needed. The web management panel is off by default. Either switch requires an app restart.
+
+Desktop packages include the web panel's `ui/` resources. Enabling "Also expose the web management panel" lets devices that can reach the gateway open the panel in a browser and sign in. Its access scope is the same as the gateway's. Disabling it only stops serving the web UI; API forwarding and local desktop management remain available. **The desktop window uses its own local session and does not require a separate web sign-in**; browser access requires an administrator account.
 
 ## Mobile
 
@@ -269,17 +274,17 @@ There are three forms — pick what you need:
 | Form | How to install | Good for |
 | --- | --- | --- |
 | **Browser / PWA** | Open `/m` in a phone browser; optionally "Add to Home Screen" | Quick look, nothing to install, the easiest option on iPhone |
-| **Android APK** | Install `Agent2API-<version>.apk` | Home-screen icon, full screen, multiple servers |
-| **iOS IPA** | Install `Agent2API-<version>.ipa` (unsigned — you re-sign it) | Home-screen icon, full screen |
+| **Android APK** | Install `Agent2API-<version>.apk` from [Downloads](https://agent2api.dev/downloads) or Release | Home-screen icon, full screen, multiple servers |
+| **iOS IPA** | Install `Agent2API-<version>.ipa` from [Downloads](https://agent2api.dev/downloads) or Release (unsigned — you re-sign it) | Home-screen icon, full screen |
 
 All three run the same UI code. The difference is who serves the page: the PWA is served by the gateway (so "also expose the web management panel" must be on), while the APK / IPA ship the UI inside the package (so they can start the UI offline and do not need that switch).
 
 ### Prerequisites (by form)
 
-**Desktop (Windows / macOS / Linux)**: both switches, one without the other will not work.
+**Desktop (Windows / macOS / Linux)**: enable network access first. Browser / PWA use also requires the web management panel.
 
-1. "Settings → General → LAN access" — lets devices on the LAN reach the gateway. The enable flow asks you to register a panel administrator first and adds a key named "default" automatically.
-2. "Settings → General → LAN access → also expose the web management panel" — serves the `ui/` static folder. **Required for the browser / PWA form** (`/m` is served by the gateway, so it returns 404 while this switch is off). **The APK / IPA do not need it** (the UI is inside the package), but they still need switch 1 — otherwise the gateway only listens on `127.0.0.1` and the phone cannot reach it.
+1. "Settings → Gateway → Network access → Allow other devices to access the gateway" — lets other devices connect, subject to network and firewall settings. Register a panel administrator first; a default gateway key is created automatically if no enabled key exists.
+2. "Settings → Gateway → Network access → also expose the web management panel" — serves the `ui/` static folder. **Required for the browser / PWA form** (`/m` is served by the gateway, so it returns 404 while this switch is off). **The APK / IPA do not need it** (the UI is inside the package), but they still need switch 1 — otherwise the gateway only listens on `127.0.0.1` and the phone cannot reach it.
 
 Both require a restart to take effect.
 
@@ -298,7 +303,7 @@ The first visit redirects to the login page; sign in with the panel administrato
 On first launch you get a "Servers" screen. Three steps:
 
 1. Tap "Add" and enter the gateway's `IP or domain:port` (e.g. `192.168.1.23:3065`). The scheme may be `http://` or `https://` (http is assumed if omitted); without a port, http gets 3065 and https uses the standard 443;
-2. Tap "Connect & save" — it probes the gateway first, so a wrong address or a gateway without LAN access is reported right there;
+2. Tap "Connect & save" — it probes the gateway first, so a wrong address or a gateway without network access is reported right there;
 3. A login page appears. Enter this gateway's administrator account and password (if none exists yet, it becomes "Create admin account").
 
 **Multiple servers**: tap "Add" again. Each server keeps its own sign-in — switching over does not require signing in again, and neither does switching back. The entry point is "Settings → Servers"; tap a row to switch to it. **The login page also has a "Switch server" link**, so after signing out (or being signed out) you don't have to log in first just to reach that list.
@@ -324,7 +329,7 @@ To sideload: drop the `.ipa` into AltStore (or SideStore), re-sign with your App
 
 **Known limitations of the IPA**:
 
-- **In-app updates can only link out**: iOS does not allow an app to download and install executable code, so "Software update" in settings shows a "Get it" button that opens the Release page instead of downloading like Android does. The PWA form updates through the Service Worker — just refresh.
+- **In-app updates link to download**: iOS does not allow an app to download and install executable code directly, so checking for updates in settings offers a "Download IPA" button (fetching the `.ipa` from the official CDN for re-signing with AltStore / SideStore or your own certificate) and a link to the official downloads page, instead of installing in-place like Android does. The PWA form updates through the Service Worker — just refresh.
 - Cleartext `http://` gateways: `Info.plist` already relaxes ATS and declares the local-network usage. The first connection triggers an "allow local network" prompt — you must accept it, otherwise every request fails with no visible explanation.
 - Everything else matches the APK: the UI follows the package version, and http is the default scheme.
 
@@ -352,7 +357,7 @@ When a new version is available, a "Restart & update" bar floats at the bottom: 
 | One-tap check-in, view check-in history | Claim onboarding rewards and plans one by one |
 | Enable/disable models, filter by provider | Edit model mappings, reasoning levels, capability flags |
 | Copy gateway keys, enable/disable keys | Create keys, set provider/model allowlists |
-| Add, edit and delete manual HTTP / SOCKS5 proxies; sync Clash Verge endpoints; enable/disable and test connectivity | — (proxy subscriptions and the built-in kernel have been discontinued) |
+| Add, edit and delete manual HTTP / SOCKS5 proxies; sync EasyClash endpoints; enable/disable and test connectivity | — (proxy subscriptions and the built-in kernel have been discontinued) |
 | Enable/disable scheduled tasks, change intervals | Change port, routing, retry, timeouts, data retention |
 | Assistant quick queries (balances / duplicate models / today's usage / rate-limited accounts) | Free-form assistant chat and tool calling |
 | View Agent takeover status, restore | Rewrite client configs (a phone cannot read local files) |

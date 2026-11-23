@@ -50,7 +50,10 @@ const SKELETON_KEYS: &[&str] = &[
     "needsReloginReason",
     "nameCustom",
     "pluginIdentity",
+    "pluginIdentityContract",
+    "pluginState",
     "usageQuery",
+    "userAgent",
 ];
 
 /// 把一条**内置家**记录的凭证字段摊成插件认的 secret 形态。
@@ -70,7 +73,8 @@ const SKELETON_KEYS: &[&str] = &[
 fn flatten_builtin_secret(record: &StoredAccount) -> Value {
     let mut secret = Map::new();
     for (key, value) in record.fields() {
-        if SKELETON_KEYS.contains(&key.as_str()) || key.starts_with(LEDGER_PREFIX) {
+        if SKELETON_KEYS.contains(&key.as_str()) || key.starts_with(LEDGER_PREFIX)
+            || super::credential_version::private_field(key) {
             continue;
         }
         secret.insert(key.clone(), value.clone());
@@ -90,19 +94,161 @@ fn flatten_builtin_secret(record: &StoredAccount) -> Value {
 const MIRROR_KEYS: [&str; 3] = ["accessToken", "refreshToken", "expiresAt"];
 
 /// 这条记录的插件 secret（`pluginSecret` 优先，否则摊平内置字段）。
-fn secret_of(record: &StoredAccount) -> Value {
+pub(super) fn secret_of(record: &StoredAccount) -> Value {
     let mut secret = match record.get(SECRET_KEY) {
         Some(value) if !value.is_null() => value.clone(),
         _ => flatten_builtin_secret(record),
     };
     let key = crate::server::core::providers::zcode::PLAN_FIELD;
-    if super::is_zcode_family(&record.provider()) {
+    if super::is_zcode_family(&record.provider()) && record.get("pluginIdentityContract").and_then(Value::as_u64) != Some(1) {
         if let Some(plan) = record.get(key).and_then(Value::as_str)
             .and_then(crate::server::core::providers::zcode::normalize_plan) {
             if let Some(fields) = secret.as_object_mut() { fields.insert(key.to_string(), Value::String(plan.to_string())); }
         }
     }
+    if let Some(fields) = secret.as_object_mut() {
+        super::credential_version::strip_private(fields);
+    }
     secret
+}
+
+/// 新单账号合同复用旧令牌镜像规则；不改变普通plugin_update_account的执行路径。
+pub(super) fn credential_version_mirror(record: &mut StoredAccount, secret: &Value) {
+    for key in MIRROR_KEYS {
+        if record.get(key).is_some() {
+            if let Some(value) = secret.get(key) { record.set(key, value.clone()); }
+        }
+    }
+}
+
+/// 重新登录或重新导入凭据后清掉旧凭据遗留的续期预约锁，避免新凭据继续被旧状态拦住。
+fn clear_refresh_reservations(record: &mut StoredAccount) {
+    let Some(mut state) = record.get("pluginState").and_then(Value::as_object).cloned() else {
+        return;
+    };
+    let mut changed = false;
+    for key in [
+        "plugin:cline-refresh-control",
+        "plugin:credential-refresh",
+        "plugin:refresh-control",
+        "plugin:accio.renewal",
+        "host.desktop-refresh.v1",
+    ] {
+        let Some(entry) = state.get_mut(key).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if entry.get("value").is_some_and(|value| !value.is_null()) {
+            let next_revision = entry
+                .get("revision")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(1);
+            entry.insert("revision".to_string(), Value::from(next_revision));
+            entry.insert("value".to_string(), Value::Null);
+            changed = true;
+        }
+    }
+    if changed {
+        record.set("pluginState", Value::Object(state));
+    }
+}
+
+/// 无公开序列化出口的任务专用投影；字段只能按值交给宿主内部快照校验。
+pub(crate) struct TaskAccountProjection {
+    id: String,
+    provider: String,
+    enabled: bool,
+    identity: String,
+    secret: Vec<u8>,
+    user_agent: Option<String>,
+}
+
+pub(crate) enum TaskProjectionError {
+    Unavailable,
+    InvalidAccount,
+    InvalidSecret,
+    TooLarge,
+    InvalidUserAgent,
+}
+
+impl TaskAccountProjection {
+    pub(crate) fn into_parts(self) -> (String, String, bool, String, Vec<u8>, Option<String>) {
+        (self.id, self.provider, self.enabled, self.identity, self.secret, self.user_agent)
+    }
+}
+
+/// 纯任务投影供点时快照和最终事务复用；不查注册表/代理、不取锁、不回写。
+pub(super) fn task_projection(record: &StoredAccount, id: &str) -> Result<TaskAccountProjection, TaskProjectionError> {
+    if !task_text(id, 512) || record.id() != id || record.provider() != "monkeycode" || !record.enabled()
+        || record.get("enabled").is_some_and(|value| !value.is_boolean()) { return Err(TaskProjectionError::InvalidAccount); }
+    let identity = match record.get("pluginIdentity") {
+        Some(value) => value.as_str().ok_or(TaskProjectionError::InvalidAccount)?,
+        None => record.id(),
+    };
+    if !task_text(identity, 1024) { return Err(TaskProjectionError::InvalidAccount); }
+    let user_agent = match record.get("userAgent") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value.len() <= 1024 => Some(value.clone()),
+        Some(_) => return Err(TaskProjectionError::InvalidUserAgent),
+    };
+    let secret = task_secret_bytes(record)?;
+    Ok(TaskAccountProjection { id: record.id().to_string(), provider: record.provider(), enabled: record.enabled(),
+        identity: identity.to_string(), secret, user_agent })
+}
+
+fn task_text(value: &str, limit: usize) -> bool {
+    !value.trim().is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
+}
+
+/// 不克隆未限长secret，也不先完整序列化再检查；与secret_of的国内旧账号摊平规则一致。
+fn task_secret_bytes(record: &StoredAccount) -> Result<Vec<u8>, TaskProjectionError> {
+    use serde::ser::{Serialize, SerializeMap};
+    const LIMIT: usize = 256 * 1024;
+    fn shape(value: &Value, level: usize, remaining: &mut usize) -> bool {
+        if *remaining == 0 { return false; }
+        *remaining -= 1;
+        match value {
+            Value::String(text) => text.len() <= LIMIT,
+            Value::Array(items) => level < 32 && items.iter().all(|item| shape(item, level + 1, remaining)),
+            Value::Object(fields) => level < 32 && fields.iter().all(|(key, item)|
+                key.len() <= LIMIT && shape(item, level + 1, remaining)),
+            _ => true,
+        }
+    }
+    struct Bounded(Vec<u8>);
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > LIMIT.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("task secret limit"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut out = Bounded(Vec::new());
+    let mut serializer = serde_json::Serializer::new(&mut out);
+    let mut remaining = 16_384;
+    match record.get(SECRET_KEY).filter(|value| !value.is_null()) {
+        Some(value) if value.is_object() => {
+            if !shape(value, 0, &mut remaining) { return Err(TaskProjectionError::TooLarge); }
+            value.serialize(&mut serializer).map_err(|_| TaskProjectionError::TooLarge)?;
+        }
+        Some(_) => return Err(TaskProjectionError::InvalidSecret),
+        None => {
+            let mut map = serde::Serializer::serialize_map(&mut serializer, None).map_err(|_| TaskProjectionError::TooLarge)?;
+            for (index, (key, value)) in record.fields().iter().enumerate() {
+                if index >= 16_384 || key.len() > LIMIT { return Err(TaskProjectionError::TooLarge); }
+                if SKELETON_KEYS.contains(&key.as_str()) || key.starts_with(LEDGER_PREFIX)
+                    || super::credential_version::private_field(key) { continue; }
+                if !shape(value, 1, &mut remaining) { return Err(TaskProjectionError::TooLarge); }
+                map.serialize_entry(key, value).map_err(|_| TaskProjectionError::TooLarge)?;
+            }
+            map.end().map_err(|_| TaskProjectionError::TooLarge)?;
+        }
+    }
+    Ok(out.0)
 }
 
 /// 进程级账号存储句柄（bootstrap 时 install 一次）。
@@ -127,6 +273,35 @@ pub fn shared() -> Option<AccountStore> {
 }
 
 impl AccountStore {
+    /// 维护操作的凭据账号按优先级排序，停用开关只用于转发选路。
+    pub(crate) fn maintenance_accounts_for_provider(&self, provider: &str) -> Vec<Value> {
+        let mut records: Vec<StoredAccount> = self.read_provider(provider)
+            .into_iter().filter(StoredAccount::has_credentials).collect();
+        records.sort_by_key(StoredAccount::order_key);
+        records.iter().map(|record| self.public_account(record)).collect()
+    }
+
+    /// 验证交互的指定账号快照：不解析出口、不枚举账号，也不调用完整公开投影。
+    /// 仅供主程序创建和复核可信调用；原有 plugin_account 的代理行为保持不变。
+    pub(crate) fn plugin_verification_snapshot(&self, provider: &str, id: &str) -> Option<Value> {
+        if provider.is_empty() || id.is_empty() { return None; }
+        let record = self.read_record(id)?;
+        if record.provider() != provider { return None; }
+        Some(serde_json::json!({
+            "id": record.id(), "provider": record.provider(),
+            "identity": record.get("pluginIdentity").cloned().unwrap_or_else(|| Value::String(record.id().to_string())),
+            "secret": secret_of(&record), "public": { "enabled": record.enabled() },
+        }))
+    }
+
+    /// 当前国内任务的单条最小投影；不解析代理，不调用公开视图，也不写回账号。
+    /// 256KiB限制只覆盖本层secret投影；read_record的原始行读取/解密仍沿用存储层约定。
+    pub(crate) fn plugin_task_snapshot(&self, id: &str) -> Result<TaskAccountProjection, TaskProjectionError> {
+        if !task_text(id, 512) { return Err(TaskProjectionError::InvalidAccount); }
+        let record = self.read_record(id).ok_or(TaskProjectionError::Unavailable)?;
+        task_projection(&record, id)
+    }
+
     /// 读一条插件账号（`{id, provider, secret, public, proxy}`）。
     ///
     /// ── 两种记录形态都读（迁移过渡期）───────────────────────────
@@ -143,7 +318,16 @@ impl AccountStore {
     pub fn plugin_account(&self, id: &str) -> Option<Value> {
         let record = self.read_record(id)?;
         let secret = secret_of(&record);
-        let public = self.public_account(&record);
+        let mut public = self.public_account(&record);
+        if let Some(fields) = public.as_object_mut() {
+            let raw = record.get("userAgent").and_then(Value::as_str).unwrap_or("");
+            let value = if matches!(record.provider().as_str(), "monkeycode" | "monkeycode-intl") {
+                crate::server::core::user_agent::task_value(&record.provider(), raw)
+            } else {
+                fields.get("userAgent").and_then(Value::as_str).unwrap_or("")
+            }.to_string();
+            fields.insert("userAgent".to_string(), Value::String(value));
+        }
         let config = record
             .get("proxy")
             .or_else(|| secret.get("proxy"))
@@ -176,16 +360,10 @@ impl AccountStore {
                 Some(ProxyResolution::Resolved(proxy)) if proxy.port.is_none() => {
                     serde_json::json!({ "state": "failed", "message": "代理端口必须是 1-65535 的整数" })
                 }
-                Some(ProxyResolution::Resolved(proxy)) => serde_json::json!({
-                    "state": "resolved",
-                    "proxy": agent2api_provider_protocol::WireProxy {
-                        protocol: proxy.protocol,
-                        host: proxy.host,
-                        port: proxy.port,
-                        username: proxy.username,
-                        password: proxy.password,
-                    },
-                }),
+                Some(ProxyResolution::Resolved(proxy)) => match crate::server::core::proxies::chain::wire_json(&proxy) {
+                    Ok(proxy) => serde_json::json!({ "state": "resolved", "proxy": proxy }),
+                    Err(message) => serde_json::json!({ "state": "failed", "message": message }),
+                },
                 Some(ProxyResolution::Failed(message)) => serde_json::json!({
                     "state": "failed",
                     "message": message,
@@ -196,8 +374,11 @@ impl AccountStore {
         Some(serde_json::json!({
             "id": record.id(),
             "provider": record.provider(),
+            "identity": record.get("pluginIdentity").cloned().unwrap_or_else(|| Value::String(record.id().to_string())),
             "secret": secret,
             "public": public,
+            "desktop": record.get("desktop").and_then(Value::as_bool).unwrap_or(false),
+            "maxConcurrentConfigured": record.get("maxConcurrent").and_then(Value::as_u64).unwrap_or(0),
             "proxy": proxy,
         }))
     }
@@ -303,8 +484,19 @@ impl AccountStore {
             record.set(SECRET_KEY, secret.clone());
             if let Some(public) = public.filter(|value| value.is_object()) {
                 record.set(PUBLIC_KEY, public.clone());
+                if record.get("pluginIdentityContract").and_then(Value::as_u64) == Some(1)
+                    || crate::server::core::providers::subscriptions::contains(&record.provider())
+                    || crate::server::core::plugin_host::script::known_provider(&record.provider())
+                    || record.is_desktop() && matches!(record.provider().as_str(),
+                        "raccoon" | "kiro" | "autoclaw" | "autoclaw-intl" | "cline-free")
+                        && public["needsRelogin"] == false {
+                    for key in ["needsRelogin", "needsReloginReason"] {
+                        if let Some(value) = public.get(key) { record.set(key, value.clone()); }
+                    }
+                }
             }
-            // 镜像（只对顶层已存在的键）：卸载插件后内置实现仍拿得到新令牌
+            // 镜像（只对顶层已存在的键）：卸载插件后内置实现仍拿得到新令牌；
+            // 若新 secret 已主动清掉刷新令牌（如小浣熊迁为 IAM），同步清掉顶层旧镜像。
             for key in MIRROR_KEYS {
                 let existed = record.get(key).is_some();
                 if !existed {
@@ -312,6 +504,18 @@ impl AccountStore {
                 }
                 if let Some(value) = secret.get(key) {
                     record.set(key, value.clone());
+                } else if key == "refreshToken"
+                    && secret.is_object()
+                    && !["refreshToken", "refresh_token", "refresh"]
+                        .iter()
+                        .any(|alias| {
+                            secret
+                                .get(*alias)
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.trim().is_empty())
+                        })
+                {
+                    record.remove(key);
                 }
             }
             if let Some(mut public) = record.get(PUBLIC_KEY).and_then(Value::as_object).cloned() {
@@ -320,7 +524,7 @@ impl AccountStore {
                 record.set(PUBLIC_KEY, Value::Object(public));
             }
             // 授权状态与当前凭据一并条件写入，不能让旧刷新失败覆盖重新登录的新凭据。
-            if record.provider() == "codearts" {
+            if record.provider() == "codearts" && record.get("pluginIdentityContract").and_then(Value::as_u64) != Some(1) {
                 if secret.get("needsRelogin").and_then(Value::as_bool) == Some(true) {
                     record.set("needsRelogin", Value::Bool(true));
                     record.set(
@@ -346,22 +550,7 @@ impl AccountStore {
         let Some(record) = self.record_by_id(&guard, id) else {
             return Value::Null;
         };
-        let key = format!("{LEDGER_PREFIX}{kind}");
-        // 显式 null 表示插件已清除记忆，不能回落到其他台账或存量字段。
-        record
-            .get(&key)
-            .or_else(|| match kind {
-                "onboarding" => record
-                    .get("pluginLedger.onboardingSettled")
-                    .or_else(|| record.get("onboardingSettled")),
-                "onboardingSettled" => record
-                    .get("pluginLedger.onboarding")
-                    .or_else(|| record.get(kind)),
-                "onboardingGrants" => record.get(kind),
-                _ => None,
-            })
-            .cloned()
-            .unwrap_or(Value::Null)
+        super::plugin_ledger::ledger_value(&record, kind)
     }
 
     /// 写插件台账。
@@ -470,7 +659,8 @@ impl AccountStore {
             }
             let is_new = current.is_none();
             let mut record = if let Some(mut record) = current {
-                let zcode_plan = super::is_zcode_family(&record.provider()).then(|| record.zcode_plan());
+                let zcode_plan = (record.get("pluginIdentityContract").and_then(Value::as_u64) != Some(1)
+                    && super::is_zcode_family(&record.provider())).then(|| record.zcode_plan());
                 record.set_provider(provider);
                 // 原插件调用保留历史来源；本体接管或首次缺来源时记当前执行来源。
                 if source == "builtin" || record.get("source").is_none() {
@@ -489,9 +679,10 @@ impl AccountStore {
                 record.set(PUBLIC_KEY, public.clone());
                 super::plugin_identity::remember_identity(&mut record, provider, identity);
                 if let Some(plan) = zcode_plan.filter(|plan| !plan.trim().is_empty()) { record.set_zcode_plan(&plan); }
-                // 重新登录拿到新凭证后，同次清掉旧凭证的重登录标记。
+                // 重新登录拿到新凭证后，同次清掉旧凭证的重登录标记与已失效的续期预约。
                 record.remove("needsRelogin");
                 record.remove("needsReloginReason");
+                clear_refresh_reservations(&mut record);
                 record
             } else {
                 let mut record = account;
@@ -513,6 +704,7 @@ impl AccountStore {
             super::plugin_identity::mirror_identity(&mut record, provider);
             // RAW secret 原样保留；旧凭证镜像契约不变，代理配置只写账号顶层。
             if let Some(proxy) = proxy { record.set_proxy(proxy.clone()); }
+            record.set("usageCredentialRevision", serde_json::json!(record.get("usageCredentialRevision").and_then(Value::as_u64).unwrap_or(0).saturating_add(1)));
             record.set_updated_at(logging::now_ms());
             if is_new {
                 crate::server::core::account_store::sql::put(&tx, &record)?;
@@ -558,7 +750,8 @@ impl AccountStore {
         // 身份、启用状态与队列元数据归网关，不能被插件展示字段覆盖。
         public.insert("id".to_string(), Value::String(record.id().to_string()));
         public.insert("provider".to_string(), Value::String(record.provider()));
-        if let Some(region) = crate::server::core::providers::qoder::endpoints::Region::from_provider_id(&record.provider()) {
+        if let Some(region) = crate::server::core::providers::qoder::endpoints::Region::from_provider_id(&record.provider())
+            .filter(|_| record.get("pluginIdentityContract").and_then(Value::as_u64) != Some(1)) {
             public.insert("edition".to_string(), Value::String(region.edition().to_string()));
             public.insert("editionLabel".to_string(), Value::String(region.label().to_string()));
         }

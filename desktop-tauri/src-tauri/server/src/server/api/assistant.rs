@@ -265,10 +265,7 @@ pub async fn chat(State(state): State<ServerState>, headers: HeaderMap, body: By
     }
     outbound_messages.extend(messages);
 
-    // 思考等级：本次请求点名的优先，没点名就用设置里存的（与模型同一套「本次
-    // 覆盖 > 默认值」语义）。写进 `reasoning_effort` —— 那是客户端显式指定的
-    // 形态，按既有口径**优先于映射上绑定的等级**（见 `model_rules::reasoning`
-    // 的模块头）；各家适配器再把它翻译成本家上游认识的档位字段。
+    // 本次请求未点名等级时使用助手设置；转发时仍受模型管理的思考等级覆盖约束。
     let reasoning = reasoning_from(&payload).or_else(|| config.reasoning.clone());
 
     let mut upstream = json!({
@@ -306,7 +303,7 @@ pub async fn chat(State(state): State<ServerState>, headers: HeaderMap, body: By
             super::assistant_images::preserve_tool_references(&mut upstream);
         }
     }
-    let telemetry = Arc::new(RequestTelemetry::with_id());
+    let telemetry = Arc::new(RequestTelemetry::with_model_key(access.key_source));
     let telemetry_id = telemetry.snapshot().id;
     // 进行中行：与真实请求同一时点。`is_test = true` —— 报表排除、请求日志标记
     // （与模型测试同一口径，见模块头）；下游模型名记用户点名的那个对外名
@@ -323,7 +320,7 @@ pub async fn chat(State(state): State<ServerState>, headers: HeaderMap, body: By
     if let Some(token) = cancellation::register(&telemetry_id) {
         telemetry.set_cancel_token(token);
     }
-    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry_id.clone());
+    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry.clone(), started_at);
 
     let outcome = state
         .upstream()
@@ -347,6 +344,14 @@ pub async fn chat(State(state): State<ServerState>, headers: HeaderMap, body: By
         .await;
 
     match outcome {
+        Ok(ForwardOutcome::Native(response)) => {
+            let context = RecordContext {
+                stats: state.request_stats(), telemetry, started_at, model: requested_model,
+                client_model: model, client_reasoning: reasoning.unwrap_or_default(), status: i64::from(response.status),
+                raw_request: None, raw_response: None, is_test: true, source: access.source,
+            };
+            super::protocol::native_response::respond(response, context, &mut guard)
+        }
         Ok(ForwardOutcome::Stream { status, stream: source }) => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             let context = RecordContext {

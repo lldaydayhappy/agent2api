@@ -8,24 +8,32 @@ use crate::server::logging;
 
 impl AutoCheckin {
     pub(super) fn planned_schedules(&self) -> Vec<checkin_schedules::Schedule> {
+        let mut schedules = checkin_schedules::list();
+        if schedules.is_empty() { return schedules; }
+        let providers: Vec<_> = schedules.iter().flat_map(|schedule| schedule.providers.iter().cloned()).collect();
+        let targets = match checkin::resolve_checkin_targets(&self.store, &providers, None) {
+            Ok((targets, _)) => targets,
+            Err(_) => return schedules,
+        };
         let now = times::now();
-        for schedule in checkin_schedules::list() {
-            let targets =
-                match checkin::resolve_checkin_targets(&self.store, &schedule.providers, None) {
-                    Ok((targets, _)) => targets,
-                    Err(_) => continue,
-                };
-            match account_plan::prepare(&schedule, &targets, now) {
+        for schedule in &mut schedules {
+            let scoped: Vec<_> = targets.iter().filter(|account| {
+                let provider = account.get("provider").and_then(Value::as_str)
+                    .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+                schedule.providers.iter().any(|id| id == provider)
+            }).cloned().collect();
+            match account_plan::prepare(schedule, &scoped, now) {
                 Ok(plan) if plan != schedule.account_plan => {
-                    if let Err(error) = account_plan::prepare_saved(&schedule.id, &targets, now) {
-                        logging::verbose("[Checkin]", &error);
+                    match account_plan::prepare_saved(&schedule.id, &scoped, now) {
+                        Ok(()) => schedule.account_plan = plan,
+                        Err(error) => logging::verbose("[Checkin]", &error),
                     }
                 }
                 Err(error) => logging::verbose("[Checkin]", &error),
                 _ => {}
             }
         }
-        checkin_schedules::list()
+        schedules
     }
 
     async fn fire_planned(&self, id: &str, source: &str) -> Option<Value> {
@@ -79,12 +87,12 @@ impl AutoCheckin {
             let Some(provider) = account_plan::take_due(id, &account, &date) else {
                 continue;
             };
-            let reason = format!(
-                "区间随机签到（{} · {}–{}）",
-                checkin_schedules::display_label(&current),
-                times::effective_time(&current, &provider),
-                times::effective_end(&current, &provider)
-            );
+            let reason = if planned.at > current.account_plan.windows.get(&provider).map(|window| window.1).unwrap_or(i64::MAX) {
+                format!("滚动窗口签到（{}）", checkin_schedules::display_label(&current))
+            } else {
+                format!("区间随机签到（{} · {}–{}）", checkin_schedules::display_label(&current),
+                    times::effective_time(&current, &provider), times::effective_end(&current, &provider))
+            };
             let selected = vec![account.clone()];
             super::write_state(json!({ "lastFiredDate": date }));
             match checkin::run_checkin_selected(
@@ -116,6 +124,11 @@ impl AutoCheckin {
                     summary = Some(result);
                 }
                 Err(error) => {
+                    crate::server::core::notifications::notify_checkin_failure(
+                        source,
+                        &reason,
+                        std::slice::from_ref(&error.message),
+                    );
                     logging::log("[Checkin]", &format!("随机签到执行失败：{}", error.message))
                 }
             }

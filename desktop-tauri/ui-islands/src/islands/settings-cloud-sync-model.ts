@@ -8,6 +8,8 @@ export type SyncStatus = {
   lastKeyFingerprint?: string
   lastError?: string
   lastErrorSource?: string
+  retryAt?: number
+  lastUploadAt?: number
 }
 
 export type CloudSyncView = {
@@ -18,12 +20,14 @@ export type CloudSyncView = {
     bucket: string
     accessKeyId: string
     endpoint: string
+    urlStyle?: string
     hasSecretKey: boolean
     userAgent: string
   }
   hasSyncPassword: boolean
   enabled: boolean
   autoSync: boolean
+  autoSyncIntervalMinutes: number
   remoteRoot: string
   profile: string
   status: SyncStatus
@@ -61,16 +65,28 @@ export type Form = {
   s3AccessKeyId: string
   s3SecretAccessKey: string
   s3Endpoint: string
+  s3UrlStyle: string
   s3UserAgent: string
   syncPassword: string
   enabled: boolean
   autoSync: boolean
+  autoSyncIntervalMinutes: number
   remoteRoot: string
   profile: string
 }
 
 export const PROVIDER_WEBDAV = 'webdav'
 export const PROVIDER_S3 = 's3'
+
+export const S3_URL_STYLE_AUTO = 'auto'
+export const S3_URL_STYLE_VIRTUAL_HOST = 'virtual_host'
+export const S3_URL_STYLE_PATH = 'path'
+
+export const S3_URL_STYLE_OPTIONS = [
+  { id: S3_URL_STYLE_AUTO, label: t('自动识别（推荐）') },
+  { id: S3_URL_STYLE_VIRTUAL_HOST, label: t('虚拟主机风格（bucket.endpoint）') },
+  { id: S3_URL_STYLE_PATH, label: t('路径风格（endpoint/bucket）') },
+] as const
 
 export const WEBDAV_PRESETS = [
   {
@@ -146,12 +162,31 @@ export function formatDateText(raw?: string): string {
   return Number.isNaN(parsed.getTime()) ? raw : parsed.toLocaleString()
 }
 
+export function detectS3PresetId(endpoint: string, region: string): string {
+  const raw = (endpoint || '').trim().toLowerCase()
+  const trimmedRegion = (region || '').trim()
+  if (raw.includes('myqcloud.com') || raw.includes('tencentcos.cn')) return 'cos'
+  if (raw.includes('aliyuncs.com')) return 'oss'
+  if (raw.includes('myhuaweicloud.')) return 'obs'
+  if (raw.includes('r2.cloudflarestorage.com') || trimmedRegion === 'auto') return 'r2'
+  if (!raw || raw.includes('amazonaws.com')) {
+    if (trimmedRegion === 'ap-guangzhou') return 'cos'
+    if (trimmedRegion === 'cn-hangzhou') return 'oss'
+    if (trimmedRegion === 'cn-north-4') return 'obs'
+    return 'aws'
+  }
+  if (raw.includes(':9000') || raw.includes('minio')) return 'minio'
+  return 'custom'
+}
+
 export function emptyForm(): Form {
   return {
     provider: PROVIDER_WEBDAV,
     webdavBaseUrl: '', webdavUsername: '', webdavPassword: '', webdavUserAgent: '',
-    s3Region: '', s3Bucket: '', s3AccessKeyId: '', s3SecretAccessKey: '', s3Endpoint: '', s3UserAgent: '',
-    syncPassword: '', enabled: false, autoSync: false, remoteRoot: 'agent2api-sync', profile: 'default',
+    s3Region: '', s3Bucket: '', s3AccessKeyId: '', s3SecretAccessKey: '', s3Endpoint: '',
+    s3UrlStyle: S3_URL_STYLE_AUTO, s3UserAgent: '',
+    syncPassword: '', enabled: false, autoSync: false, autoSyncIntervalMinutes: 5,
+    remoteRoot: 'agent2api-sync', profile: 'default',
   }
 }
 
@@ -167,11 +202,13 @@ export function formFromView(view: CloudSyncView): Form {
     s3Bucket: view.s3.bucket,
     s3AccessKeyId: view.s3.accessKeyId,
     s3Endpoint: view.s3.endpoint,
+    s3UrlStyle: view.s3.urlStyle || S3_URL_STYLE_AUTO,
     s3SecretAccessKey: '',
     s3UserAgent: view.s3.userAgent,
     syncPassword: '',
     enabled: view.enabled,
     autoSync: view.autoSync,
+    autoSyncIntervalMinutes: view.autoSyncIntervalMinutes || 5,
     remoteRoot: view.remoteRoot,
     profile: view.profile,
   }
@@ -189,10 +226,12 @@ export function payloadOf(form: Form): Record<string, unknown> {
     s3AccessKeyId: form.s3AccessKeyId,
     s3SecretAccessKey: form.s3SecretAccessKey,
     s3Endpoint: form.s3Endpoint,
+    s3UrlStyle: form.s3UrlStyle || S3_URL_STYLE_AUTO,
     s3UserAgent: form.s3UserAgent,
     syncPassword: form.syncPassword,
     enabled: form.enabled,
     autoSync: form.autoSync,
+    autoSyncIntervalMinutes: form.autoSyncIntervalMinutes,
     remoteRoot: form.remoteRoot,
     profile: form.profile,
   }

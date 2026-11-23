@@ -22,8 +22,9 @@ import { errorMessage, shared, toast } from './settings-model'
 import { t } from '../i18n'
 import { Alert } from '@ui'
 import {
-  emptyForm, formFromView, formatDateText, formatTime, payloadOf, PROVIDER_S3, PROVIDER_WEBDAV,
-  S3_PRESETS, WEBDAV_PRESETS, type CloudSyncView, type Form, type RemoteInfo,
+  detectS3PresetId, emptyForm, formFromView, formatDateText, formatTime, payloadOf,
+  PROVIDER_S3, PROVIDER_WEBDAV, S3_PRESETS, S3_URL_STYLE_OPTIONS, WEBDAV_PRESETS,
+  type CloudSyncView, type Form, type RemoteInfo,
 } from './settings-cloud-sync-model'
 
 /**
@@ -69,10 +70,13 @@ export function CloudSyncPanel() {
   const [remote, setRemote] = React.useState<RemoteInfo | null>(null)
   const [dialog, setDialog] = React.useState<DialogKind>(null)
   const [keyPassword, setKeyPassword] = React.useState('')
+  const [s3PresetOverride, setS3PresetOverride] = React.useState<string | null>(null)
 
   const isWebDav = form.provider === PROVIDER_WEBDAV
   const webdavPreset = WEBDAV_PRESETS.find(item => item.baseUrl && form.webdavBaseUrl.includes(new URL(item.baseUrl).host))
-  const s3Preset = S3_PRESETS.find(item => item.id !== 'custom' && item.label === 'Cloudflare R2' && form.s3Region === 'auto') ?? S3_PRESETS[0]
+  const detectedS3PresetId = s3PresetOverride ?? detectS3PresetId(form.s3Endpoint, form.s3Region)
+  const s3Preset = S3_PRESETS.find(item => item.id === detectedS3PresetId) ?? S3_PRESETS[0]
+  const s3UrlStyleOption = S3_URL_STYLE_OPTIONS.find(item => item.id === form.s3UrlStyle) ?? S3_URL_STYLE_OPTIONS[0]
 
   /** 取一次设置并铺进表单（保留用户正在编辑的密码输入） */
   const load = React.useCallback((keepPassword = false, silent = false): Promise<void> => {
@@ -420,7 +424,10 @@ export function CloudSyncPanel() {
                           disabled={disabled}
                           onValueChange={value => {
                             const preset = S3_PRESETS.find(item => item.id === value)
-                            if (preset) patch({ s3Region: preset.regionPlaceholder })
+                            if (preset) {
+                              setS3PresetOverride(preset.id)
+                              patch({ s3Region: preset.regionPlaceholder })
+                            }
                           }}
                         >
                           <SelectTrigger className='min-w-[220px]'>
@@ -484,8 +491,34 @@ export function CloudSyncPanel() {
                         value={form.s3Endpoint}
                         disabled={disabled}
                         placeholder={t('留空使用 AWS 官方地址')}
-                        onChange={event => patch({ s3Endpoint: event.target.value })}
+                        onChange={event => {
+                          setS3PresetOverride(null)
+                          patch({ s3Endpoint: event.target.value })
+                        }}
                       />
+                    </div>
+                    <div className='retention-row'>
+                      <Label htmlFor='cloud-s3-url-style'>{t('地址风格')}</Label>
+                      <div className='routing-row'>
+                        <Select
+                          value={s3UrlStyleOption.id}
+                          disabled={disabled}
+                          onValueChange={value => {
+                            if (value) patch({ s3UrlStyle: String(value) })
+                          }}
+                        >
+                          <SelectTrigger id='cloud-s3-url-style' className='min-w-[220px]'>
+                            <SelectValue>{s3UrlStyleOption.label}</SelectValue>
+                          </SelectTrigger>
+                          <SelectContent>
+                            {S3_URL_STYLE_OPTIONS.map(item => (
+                              <SelectItem key={item.id} value={item.id}>
+                                {item.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
                     </div>
                     <div className='retention-row'>
                       <Label htmlFor='cloud-s3-ua'>{t('自定义 User-Agent')}</Label>
@@ -553,8 +586,23 @@ export function CloudSyncPanel() {
                     onCheckedChange={checked => patch({ autoSync: checked })}
                   />
                   <div className='hint'>
-                    {t('本地账号、配置、签到与余额记录变化后自动上传（合并 1 秒内的连续改动，最长 10 秒传一次；内容没变时不发请求）。')}
+                    {t('仅在账号、配置、签到或余额等实质内容变化时上传；导出时间或查询时间单独变化不会触发上传。')}
                   </div>
+                </div>
+                <div className='retention-row'>
+                  <Label htmlFor='cloud-auto-sync-interval'>{t('最小自动上传间隔')}</Label>
+                  <Select value={String(form.autoSyncIntervalMinutes)} disabled={disabled || !form.autoSync || !form.enabled}
+                    onValueChange={value => { if (value !== null) patch({ autoSyncIntervalMinutes: Number(value) }) }}>
+                    <SelectTrigger id='cloud-auto-sync-interval' className='min-w-[220px]'>
+                      <SelectValue>{t('{minutes} 分钟', { minutes: form.autoSyncIntervalMinutes })}</SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      {[...new Set([5, 15, 30, 60, form.autoSyncIntervalMinutes])].sort((a, b) => a - b).map(minutes => (
+                        <SelectItem key={minutes} value={String(minutes)}>{t('{minutes} 分钟', { minutes })}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <div className='hint'>{t('默认 5 分钟。间隔内的变化合并为最新快照，到期后上传；手动上传不受限制。失败后会延长等待并自动重试。')}</div>
                 </div>
                 <div className='retention-row'>
                   <Label htmlFor='cloud-enabled'>{t('启用云同步')}</Label>
@@ -612,7 +660,8 @@ export function CloudSyncPanel() {
                   <br />
                   {status.lastError}
                   <br />
-                  {t('改动仍保存在本机，修复网络或凭据后下一次改动会自动重试，也可以手动点「上传到云端」。')}
+                  {t('改动仍保存在本机，系统会延长等待并自动重试；修复网络或凭据后，也可以手动点「上传到云端」。')}
+                  {status.retryAt ? <div>{t('下次自动重试：{time}', { time: formatTime(status.retryAt) })}</div> : null}
                 </Alert>
               ) : null}
 

@@ -12,12 +12,8 @@
 //!      成对出现，所以回程要保证配对（见 `normalize_tool_pairing`）。
 //!
 //! ── 思考（thinking）怎么映射 ────────────────────────────────
-//! Anthropic 侧是 `thinking` 内容块 + `signature`（签名，用于多轮校验）；
-//! Chat 侧是 `reasoning_content` 字符串。Chat 没有签名这个概念，所以：
-//!   - 回程（Anthropic → Chat）：thinking 块折进 `reasoning_content`，
-//!     signature **丢弃**（Chat 侧无处安放，且下游上游都不校验它）；
-//!   - 去程（Chat → Anthropic）：`reasoning_content` 折成 thinking 块，
-//!     不带 signature（Anthropic 的签名只在它自己的多轮里需要）。
+//! 本模块只服务跨协议转换：Chat 的 reasoning_content 不能表达 Anthropic 签名。
+//! 两端都是 Anthropic 时由原生转发路径保留完整内容块、签名与事件，不经过本模块重建。
 //!
 //! `thinking.type:"enabled"` 时 Anthropic 要求 `budget_tokens < max_tokens`，
 //! 所以去程会把 max_tokens 抬高到 budget 之上（参考实现同款处理）。
@@ -28,8 +24,8 @@
 use serde_json::{json, Map, Value};
 
 use super::{
-    content_parts, content_text, event_frame, is_truthy, json_text, native_tool, random_id,
-    string_field, string_value, tool_plan, SseLineBuffer, TOOL_IMAGE_PLACEHOLDER,
+    content_parts, content_text, event_frame, is_newline_only, is_truthy, json_text, native_tool,
+    random_id, string_field, string_value, tool_plan, SseLineBuffer, TOOL_IMAGE_PLACEHOLDER,
     FIELD_CACHE_CONTROL, FIELD_IS_ERROR,
 };
 use super::responses::ConvertError;
@@ -678,23 +674,7 @@ pub(super) fn parse_json_object(value: &Value) -> Value {
 
 /// Chat 的 usage → Anthropic 的 usage
 pub fn usage_to_anthropic(usage: Option<&Value>) -> Value {
-    let Some(usage) = usage.filter(|value| value.is_object()) else {
-        return json!({ "input_tokens": 0, "output_tokens": 0 });
-    };
-    let number = |key: &str| -> i64 {
-        usage.get(key).and_then(Value::as_i64).unwrap_or(0)
-    };
-    let cached = usage
-        .pointer("/prompt_tokens_details/cached_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let input = number("prompt_tokens");
-    json!({
-        // Anthropic 的 input_tokens **不含**缓存命中部分，所以这里减掉
-        "input_tokens": (input - cached).max(0),
-        "output_tokens": number("completion_tokens"),
-        "cache_read_input_tokens": cached,
-    })
+    usage.and_then(super::usage::TokenUsage::from_chat).unwrap_or_default().anthropic()
 }
 
 /// 输入 token 估算：字符数 ÷ 3.5（中英混排的经验值，与 Anthropic 官方
@@ -744,6 +724,8 @@ pub struct AnthropicStream {
     block_arguments: String,
     saw_arguments: bool,
     has_tool: bool,
+    /// 思考块开启期间暂存的纯换行分片，避免保活换行把思考拆成多个 thinking 块
+    pending_leading_newlines: String,
     stop_reason: Option<String>,
     usage: Option<Value>,
     /// 下游请求体的输入 token 估算（`estimate_tokens_for_body`）。
@@ -774,6 +756,7 @@ impl AnthropicStream {
             block_arguments: String::new(),
             saw_arguments: false,
             has_tool: false,
+            pending_leading_newlines: String::new(),
             stop_reason: None,
             usage: None,
             input_estimate,
@@ -813,6 +796,12 @@ impl AnthropicStream {
         self.finished = true;
         out.extend(self.emit_start());
         out.extend(self.close_block());
+        if !self.has_tool && !self.pending_leading_newlines.is_empty() {
+            let prefix = std::mem::take(&mut self.pending_leading_newlines);
+            out.extend(self.ensure_block("text"));
+            out.extend(self.push_text_delta(&prefix));
+            out.extend(self.close_block());
+        }
         let stop_reason = self
             .stop_reason
             .clone()
@@ -854,7 +843,7 @@ impl AnthropicStream {
             }
         }
         if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
-            self.usage = Some(usage.clone());
+            super::usage::merge_chat(&mut self.usage, usage);
         }
         let choice = chunk.pointer("/choices/0");
         if let Some(finish) = choice
@@ -880,6 +869,9 @@ impl AnthropicStream {
             if from_field.is_empty() { string_field(delta, "reasoning") } else { from_field }
         };
         if !reasoning.is_empty() {
+            if self.block_open && self.block_type == "thinking" {
+                self.pending_leading_newlines.clear();
+            }
             out.extend(self.ensure_block("thinking"));
             self.block_text.push_str(&reasoning);
             out.push(self.event(
@@ -890,17 +882,18 @@ impl AnthropicStream {
                 }),
             ));
         }
-        // 正文增量 → text 块
+        // 正文增量 → text 块（思考期间先到的纯换行暂存，待真正转入正文再吐出）
         if let Some(text) = delta.get("content").and_then(Value::as_str).filter(|text| !text.is_empty()) {
-            out.extend(self.ensure_block("text"));
-            self.block_text.push_str(text);
-            out.push(self.event(
-                "content_block_delta",
-                json!({
-                    "index": self.block_index,
-                    "delta": { "type": "text_delta", "text": text },
-                }),
-            ));
+            if self.block_open && self.block_type == "thinking" && is_newline_only(text) {
+                self.pending_leading_newlines.push_str(text);
+            } else {
+                let prefix = std::mem::take(&mut self.pending_leading_newlines);
+                out.extend(self.ensure_block("text"));
+                if !prefix.is_empty() {
+                    out.extend(self.push_text_delta(&prefix));
+                }
+                out.extend(self.push_text_delta(text));
+            }
         }
         // 工具调用 → tool_use 块
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -913,6 +906,7 @@ impl AnthropicStream {
 
     fn consume_tool(&mut self, call: &Value) -> Vec<bytes::Bytes> {
         let mut out = Vec::new();
+        self.pending_leading_newlines.clear();
         let name = call.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
         let id = call.get("id").and_then(Value::as_str).unwrap_or("");
         // 新的工具调用（带 id/name 且与当前块不同）：关掉旧块、开新块
@@ -982,6 +976,17 @@ impl AnthropicStream {
         out
     }
 
+    fn push_text_delta(&mut self, text: &str) -> Vec<bytes::Bytes> {
+        self.block_text.push_str(text);
+        vec![self.event(
+            "content_block_delta",
+            json!({
+                "index": self.block_index,
+                "delta": { "type": "text_delta", "text": text },
+            }),
+        )]
+    }
+
     /// 确保当前打开的是指定类型的块（类型不同则先关旧的）
     fn ensure_block(&mut self, kind: &str) -> Vec<bytes::Bytes> {
         if self.block_open && self.block_type == kind {
@@ -1030,19 +1035,12 @@ impl AnthropicStream {
             return Vec::new();
         }
         self.started = true;
-        let mut usage = usage_to_anthropic(self.usage.as_ref());
-        usage["output_tokens"] = json!(0);
-        // 上游 usage 通常整条流都不来（要等末尾那帧），而客户端把
-        // `message_start` 的 usage 当作本轮输入的事实快照 —— 填 0 会让它退回
-        // 本地估算并逐轮累加（issue #437）。用调用方给的估算顶上；真值到达时
-        // 由 `message_delta` 校正。上游这次提前带了真实 usage 就保留真值，
-        // 估算不覆盖它。缓存字段此刻本就不存在，也不在这里补 —— 估算值写进
-        // `cache_read_input_tokens` 会把请求统计的缓存命中率抬虚。
-        if self.usage.is_none() {
-            if let Some(estimate) = self.input_estimate {
-                usage["input_tokens"] = json!(estimate);
-            }
-        }
+        let mut tokens = self.usage.as_ref()
+            .and_then(super::usage::TokenUsage::from_chat).unwrap_or_default();
+        // 估算的是输入总量；已知的缓存读写仍须从普通输入中扣除。
+        tokens.prompt = tokens.prompt.or(self.input_estimate);
+        tokens.completion = Some(0);
+        let usage = tokens.anthropic();
         vec![self.event(
             "message_start",
             json!({
@@ -1126,7 +1124,7 @@ impl AnthropicCollector {
             }
         }
         if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
-            self.usage = Some(usage.clone());
+            super::usage::merge_chat(&mut self.usage, usage);
         }
         let choice = chunk.pointer("/choices/0");
         if let Some(finish) = choice

@@ -45,6 +45,8 @@ pub(super) fn stage_all(adapters: Vec<(String, Arc<RpcAdapter>)>) {
         else { table.adapters.insert(id, adapter); }
     }
     crate::server::core::providers::catalog::invalidate();
+    drop(table);
+    changed().notify_waiters();
 }
 
 pub(super) fn callback_adapter(id: &str) -> Option<Arc<dyn ProviderAdapter>> {
@@ -99,6 +101,11 @@ pub fn serves(id: &str) -> bool {
     table().lock().unwrap_or_else(|error| error.into_inner()).adapters.contains_key(id)
 }
 
+pub fn dynamic_login(id: &str) -> bool {
+    table().lock().unwrap_or_else(|error| error.into_inner()).adapters.get(id)
+        .is_some_and(|adapter| adapter.dynamic_login())
+}
+
 pub fn installed_ids() -> Vec<String> {
     let table = table().lock().unwrap_or_else(|error| error.into_inner());
     let mut ids: Vec<_> = table.adapters.keys()
@@ -114,10 +121,12 @@ pub fn remove(id: &str) {
     crate::server::core::providers::catalog::invalidate();
     super::rpc_cache::forget(id);
     super::schedules::forget(id);
+    super::wasm::forget(id);
     changed().notify_waiters();
 }
 
 pub fn clear() {
+    for id in installed_ids() { super::wasm::forget(&id); }
     crate::server::core::providers::catalog::invalidate();
     table().lock().unwrap_or_else(|error| error.into_inner()).adapters.clear();
     crate::server::core::providers::catalog::invalidate();
@@ -156,13 +165,17 @@ impl SwitchGuard {
         }
         crate::server::core::providers::catalog::invalidate();
         drop(table);
-        for id in &self.providers { super::schedules::forget(id); }
+        for id in &self.providers {
+            super::schedules::forget(id);
+            super::wasm::tasks::forget(id);
+        }
     }
 }
 
 impl Drop for SwitchGuard {
     fn drop(&mut self) {
         let mut table = table().lock().unwrap_or_else(|error| error.into_inner());
+        let mut removed = Vec::new();
         for id in &self.providers {
             if let Some(adapter) = table.staged.remove(id).filter(|adapter| adapter.host().ready()) {
                 table.adapters.insert(id.clone(), adapter);
@@ -170,11 +183,17 @@ impl Drop for SwitchGuard {
             table.switching.remove(id);
             if table.adapters.get(id).is_some_and(|adapter| adapter.host().activity.retired()) {
                 table.adapters.remove(id);
+                removed.push(id.clone());
             }
         }
         self.pauses.clear();
         crate::server::core::providers::catalog::invalidate();
         drop(table);
+        for id in removed {
+            super::rpc_cache::forget(&id);
+            super::schedules::forget(&id);
+            super::wasm::forget(&id);
+        }
         changed().notify_waiters();
     }
 }

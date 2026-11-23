@@ -98,10 +98,7 @@ fn preview_json(state: &ServerState, payload: Preview) -> Value {
         let profile = if let Some(mut profile) = global_draft {
             let sorting = crate::server::core::account_order::sorting(&accounts, crate::server::logging::now_ms());
             for (provider, rules) in &sorting.rules {
-                let automatic = rules.iter().any(|rule| match rule {
-                    config::AccountSortRule::Credit { on, .. } => *on && crate::server::core::account_order::supports_credit_expiry(provider),
-                    config::AccountSortRule::Added { on, .. } => *on,
-                });
+                let automatic = rules.iter().any(|rule| crate::server::core::account_order::rule_enabled(provider, rule));
                 if automatic { profile.account_order.remove(provider); }
             }
             profile
@@ -125,7 +122,7 @@ fn preview_json(state: &ServerState, payload: Preview) -> Value {
     });
     let keys = routing::CooldownKeys::new(&payload.model);
     let counts = state.upstream().connections().snapshot().into_iter().collect();
-    let (sunk, resting, open) = state.upstream().route_queue_facts(now);
+    let (sunk, resting, open) = state.upstream().route_queue_facts_for(&candidates, &keys, now);
     let facts = crate::server::core::limiter::sources::facts();
     let counters = crate::server::core::limiter::counter::facts();
     let limiter = candidates.iter().filter(|account| crate::server::core::limiter::evaluate::blocked(account, &keys.for_account(account), &facts, &counters, now))

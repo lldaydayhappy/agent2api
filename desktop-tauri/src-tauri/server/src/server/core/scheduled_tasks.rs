@@ -39,6 +39,7 @@
 //! 它独有的语义。硬塞进 `{enabled, interval}` 会逼着两边都变形。
 //! 界面上它仍在同一页展示，只是读改走 `/api/auto-checkin`。
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -46,7 +47,7 @@ use serde_json::{json, Value};
 use crate::server::config;
 use crate::server::config::IntervalTaskPatch;
 use crate::server::core::account_store::AccountStore;
-use crate::server::core::task_state::{self, Claim, TaskState};
+use crate::server::core::task_state::{self, TaskState};
 use crate::server::core::update::UpdateManager;
 use crate::server::logging;
 
@@ -77,14 +78,16 @@ pub struct TaskDef {
 pub const TASK_CREDENTIAL_MAINTENANCE: &str = config::KEY_CREDENTIAL_MAINTENANCE;
 pub const TASK_MODEL_REFRESH: &str = config::KEY_MODEL_REFRESH;
 pub const TASK_UPDATE_CHECK: &str = config::KEY_UPDATE_CHECK;
+pub const TASK_PLUGIN_CATALOG: &str = crate::server::core::maintenance::PLUGIN_CATALOG;
+pub const TASK_MAGPIE_PLUGIN: &str = config::KEY_MAGPIE_PLUGIN_CHECK;
 pub const TASK_LOGS_AUTO_REFRESH: &str = config::KEY_LOGS_AUTO_REFRESH;
 pub const TASK_REQUESTS_AUTO_REFRESH: &str = config::KEY_REQUESTS_AUTO_REFRESH;
 pub const TASK_REPORT_AUTO_REFRESH: &str = config::KEY_REPORT_AUTO_REFRESH;
 
-pub const TASKS: [TaskDef; 6] = [
+pub const TASKS: [TaskDef; 8] = [
     TaskDef {
         id: TASK_CREDENTIAL_MAINTENANCE,
-        label: "凭证自动维护",
+        label: "凭证维护",
         description: "定期遍历账号，只刷新已过期或临期的凭证。重启后沿用上次排期，失败账号在冷却后重试；转发需要的按需续期不受此开关影响。",
         unit: "minutes",
         runner: Runner::Backend,
@@ -94,7 +97,7 @@ pub const TASKS: [TaskDef; 6] = [
     },
     TaskDef {
         id: TASK_MODEL_REFRESH,
-        label: "模型目录刷新",
+        label: "模型目录更新",
         description: "定期拉取最新模型清单，重启沿用排期与缓存。客户端读取模型列表的后台刷新也遵守本任务开关、间隔和失败冷却；手动获取模型可提前刷新。同一轮顺带刷新 models.dev 模型元数据（能力位与思考档位，可在设置页单独关闭）。",
         unit: "minutes",
         runner: Runner::Backend,
@@ -104,13 +107,33 @@ pub const TASKS: [TaskDef; 6] = [
     },
     TaskDef {
         id: TASK_UPDATE_CHECK,
-        label: "软件版本检查",
-        description: "定期向 GitHub 查询最新发布版本，默认每 20 分钟一次。检查结果、排期和限流冷却跨重启保留；手动检查也会合并重复请求并遵守冷却。开关与间隔在「软件更新」面板的「更新设置」弹窗里配置（定时任务页不再渲染这一条）。",
+        label: "软件检查更新",
+        description: "定期检查最新发布版本，默认每 4 小时一次。检查结果、排期和冷却跨重启保留；与「设置 → 软件更新」共用设置与检查结果。",
         unit: "minutes",
         runner: Runner::Backend,
         min: config::INTERVAL_MIN_MINUTES,
         max: config::INTERVAL_MAX_MINUTES,
         default_interval: config::DEFAULT_UPDATE_CHECK_MINUTES,
+    },
+    TaskDef {
+        id: TASK_PLUGIN_CATALOG,
+        label: "社区插件检查",
+        description: "定期刷新社区插件目录并检查已安装插件更新；开启自动更新时自动升级已启用且已签名的插件。默认跟随「软件检查更新」，也可单独调整。",
+        unit: "minutes",
+        runner: Runner::Backend,
+        min: config::INTERVAL_MIN_MINUTES,
+        max: config::INTERVAL_MAX_MINUTES,
+        default_interval: config::DEFAULT_UPDATE_CHECK_MINUTES,
+    },
+    TaskDef {
+        id: TASK_MAGPIE_PLUGIN,
+        label: "Magpie 插件检查",
+        description: "定期刷新 Magpie 官方与 GitHub 插件清单，并检查已安装脚本插件的新版本，默认每 6 小时一次。",
+        unit: "minutes",
+        runner: Runner::Backend,
+        min: config::INTERVAL_MIN_MINUTES,
+        max: config::INTERVAL_MAX_MINUTES,
+        default_interval: config::DEFAULT_MAGPIE_PLUGIN_CHECK_MINUTES,
     },
     TaskDef {
         id: TASK_LOGS_AUTO_REFRESH,
@@ -153,6 +176,14 @@ fn settings_of(settings: config::ScheduledSettings, id: &str) -> config::Interva
         TASK_CREDENTIAL_MAINTENANCE => settings.credential_maintenance,
         TASK_MODEL_REFRESH => settings.model_refresh,
         TASK_UPDATE_CHECK => settings.update_check,
+        TASK_PLUGIN_CATALOG => {
+            let plugin_settings = crate::server::core::plugin_host::settings::current();
+            config::IntervalTask {
+                enabled: plugin_settings.auto_check,
+                interval: plugin_settings.interval,
+            }
+        }
+        TASK_MAGPIE_PLUGIN => settings.magpie_plugin_check,
         TASK_LOGS_AUTO_REFRESH => settings.logs_auto_refresh,
         TASK_REQUESTS_AUTO_REFRESH => settings.requests_auto_refresh,
         TASK_REPORT_AUTO_REFRESH => settings.report_auto_refresh,
@@ -166,10 +197,10 @@ fn interval_ms(task: &TaskDef) -> i64 {
 }
 
 fn state_key(id: &str) -> String {
-    if id == TASK_UPDATE_CHECK {
-        crate::server::core::update::global_check_key()
-    } else {
-        id.to_string()
+    match id {
+        TASK_UPDATE_CHECK => crate::server::core::update::global_check_key(),
+        TASK_PLUGIN_CATALOG => crate::server::core::plugin_host::catalog::key(),
+        _ => id.to_string(),
     }
 }
 
@@ -179,7 +210,7 @@ fn task_json(task: &TaskDef, state: Result<TaskState, String>) -> Value {
     let error = state.as_ref().err().cloned();
     let state = state.unwrap_or_default();
     let timestamp = |at: i64| if at > 0 { json!(at) } else { Value::Null };
-    json!({
+    let mut item = json!({
         "id": task.id,
         "label": task.label,
         "description": task.description,
@@ -199,7 +230,16 @@ fn task_json(task: &TaskDef, state: Result<TaskState, String>) -> Value {
         "retryAt": timestamp(state.retry_at),
         "nextRunAt": if backend && settings.enabled { timestamp(state.due_at().max(logging::now_ms())) } else { Value::Null },
         "canRun": backend,
-    })
+    });
+    if task.id == TASK_PLUGIN_CATALOG {
+        let plugin_settings = crate::server::core::plugin_host::settings::current();
+        item["checkMode"] = json!(match plugin_settings.check_mode {
+            crate::server::core::plugin_host::settings::SettingsMode::Follow => "follow",
+            crate::server::core::plugin_host::settings::SettingsMode::Custom => "custom",
+        });
+        item["autoUpdate"] = json!(plugin_settings.auto_update);
+    }
+    item
 }
 
 pub fn list() -> Value {
@@ -207,19 +247,7 @@ pub fn list() -> Value {
     // 逐条任务各读一次库（四次读 + 四次解析）没有意义。
     let states = task_state::read_all();
     json!({
-        "tasks": TASKS
-            .iter()
-            .map(|task| {
-                let state = match &states {
-                    Ok(states) if task.runner == Runner::Backend => {
-                        Ok(states.get(&state_key(task.id)).cloned().unwrap_or_default())
-                    }
-                    Ok(_) => Ok(TaskState::default()),
-                    Err(error) => Err(error.clone()),
-                };
-                task_json(task, state)
-            })
-            .collect::<Vec<_>>(),
+        "tasks": TASKS.iter().map(|task| task_from_states(task.id, &states)).collect::<Vec<_>>(),
     })
 }
 
@@ -236,8 +264,72 @@ pub fn task_by_id(id: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+pub fn tasks_by_ids(ids: &[&str]) -> Vec<Value> {
+    let states = task_state::read_all();
+    ids.iter().map(|id| task_from_states(id, &states)).collect()
+}
+
+fn task_from_states(id: &str, states: &Result<HashMap<String, TaskState>, String>) -> Value {
+    find(id).map(|task| {
+        let state = match states {
+            Ok(states) if task.runner == Runner::Backend => {
+                Ok(states.get(&state_key(task.id)).cloned().unwrap_or_default())
+            }
+            Ok(_) => Ok(TaskState::default()),
+            Err(error) => Err(error.clone()),
+        };
+        task_json(task, state)
+    }).unwrap_or(Value::Null)
+}
+
 pub fn configure(id: &str, patch: IntervalTaskPatch) -> Result<Value, String> {
+    configure_extended(id, patch, None, None)
+}
+
+pub fn configure_extended(
+    id: &str,
+    patch: IntervalTaskPatch,
+    check_mode: Option<&str>,
+    auto_update: Option<bool>,
+) -> Result<Value, String> {
     let task = find(id).ok_or_else(|| format!("未知的定时任务: {id}"))?;
+    if id == TASK_PLUGIN_CATALOG {
+        if patch.enabled.is_none() && patch.interval.is_none() && check_mode.is_none() && auto_update.is_none() {
+            return Err("没有需要更新的字段".to_string());
+        }
+        if check_mode != Some("follow") {
+            if let Some(interval) = patch.interval {
+                if !(task.min..=task.max).contains(&interval) {
+                    return Err(format!("「{}」的间隔必须是 {}–{} 分钟", task.label, task.min, task.max));
+                }
+            }
+        }
+        let before = settings_of(config::scheduled_settings(), id);
+        let mut payload = serde_json::Map::new();
+        if let Some(mode) = check_mode {
+            payload.insert("checkMode".to_string(), json!(mode));
+        }
+        if check_mode != Some("follow") {
+            if let Some(enabled) = patch.enabled {
+                payload.insert("autoCheck".to_string(), json!(enabled));
+            }
+            if let Some(interval) = patch.interval {
+                payload.insert("interval".to_string(), json!(interval));
+            }
+        }
+        if let Some(auto) = auto_update {
+            payload.insert("autoUpdate".to_string(), json!(auto));
+        }
+        let configured = crate::server::core::plugin_host::settings::configure(&Value::Object(payload))?;
+        let after = settings_of(config::scheduled_settings(), id);
+        if before != after {
+            logging::log("[Tasks]", &format!("定时任务「{}」已{}，间隔 {} 分钟", task.label,
+                if after.enabled { "开启" } else { "关闭" }, after.interval));
+        }
+        let mut result = task_by_id(id);
+        result["saved"] = configured.get("saved").cloned().unwrap_or(json!(true));
+        return Ok(result);
+    }
     if patch.enabled.is_none() && patch.interval.is_none() {
         return Err("没有需要更新的字段".to_string());
     }
@@ -287,26 +379,6 @@ pub async fn run_now(store: &AccountStore, update: &UpdateManager, id: &str) -> 
     run_backend(store, update, task, true).await
 }
 
-/// 「部分账号失败」算不算这一轮失败（`RunGuard::finish` 的 `success`）。
-///
-/// ── 为什么不算 ──────────────────────────────────────────────
-/// `success = false` 会按失败次数做指数退避（最长 24 小时，见 `core::task_state`
-/// 的 `RunGuard::finish`）。而后端任务的失败常常是**按账号**的：一个账号的登录态
-/// 被上游作废（refreshToken 废了、接口稳定 401）就足以让每一轮都判失败一次，
-/// 整条任务于是被推到几小时后再跑，其余账号跟着一起变旧。失败本身已经如实进了
-/// 结果与日志，不需要再把整轮一起罚掉。
-///
-/// 模型目录刷新同理，而且它的失败是**按提供商**的（见 `TASK_MODEL_REFRESH`
-/// 分支的调用点）：一家长期 401 就足以把整条任务按到 24 小时冷却上，界面上
-/// 显示成「冷却中」，看起来就是刷新功能坏了。
-///
-/// ── 为什么「一个都没成功」仍算失败 ───────────────────────────
-/// 全失败通常意味着更上游的问题（断网、出口被挡、上游整体故障）：这时保留退避，
-/// 别按原间隔反复打上游。判据因此是「有失败 **且** 一个都没成功」。
-fn round_succeeded(succeeded: usize, failed: usize) -> bool {
-    failed == 0 || succeeded > 0
-}
-
 async fn run_backend(
     store: &AccountStore,
     update: &UpdateManager,
@@ -324,91 +396,22 @@ async fn run_backend(
             summary
         } else { "已完成版本检查".to_string() });
     }
-    // 手动执行越不越过失败冷却：按**冷却记的是什么**分两类（见 `ManualBackoff`）。
-    //   · 记「上一轮为什么没成功」的（模型目录刷新、凭证维护）——
-    //     用户按按钮往往正是刚把那个原因修好（换了账号、重新登录、把坏账号删了），
-    //     继续拿旧结论挡着只会让按钮看起来是坏的；
-    //   · 记「上游配额桶什么时候恢复」的（检查更新）—— 提前打一次只会再吃一次
-    //     403 并把恢复时刻重新顶到未来，如实告诉用户还要等多久更有用。
-    let backoff = match task.id {
-        TASK_MODEL_REFRESH | TASK_CREDENTIAL_MAINTENANCE => task_state::ManualBackoff::Bypass,
-        _ => task_state::ManualBackoff::Respect,
-    };
-    let guard = match task_state::claim(task.id, interval_ms(task), manual, backoff, 1_000)? {
-        Claim::Acquired(guard) => guard,
-        // 被挡住的原因要如实说：走 Bypass 的家（模型刷新 / 凭证维护）在手动
-        // 路径上并不受冷却约束，这时还提示「请在 N 秒后重试」会把用户往几分钟
-        // 甚至几小时后引 —— 而真正挡住这一轮的只是在途占位或一秒的最短间隔。
-        Claim::Deferred(state) => {
-            return Err(if manual && backoff == task_state::ManualBackoff::Bypass {
-                state.waiting_message_bypassing()
-            } else {
-                state.waiting_message()
-            })
-        }
-    };
-    let (summary, success) = match task.id {
-        TASK_CREDENTIAL_MAINTENANCE => {
-            let results = crate::server::core::credential_maintenance::refresh_expiring_accounts(store).await;
-            let (refreshed, skipped, failed) = crate::server::core::credential_maintenance::summarize(&results);
-            let summary = format!("刷新 {refreshed} 个，跳过 {skipped} 个，失败 {failed} 个");
-            if refreshed > 0 || failed > 0 {
-                logging::log_with_level("[Maintenance]", &format!("凭证自动维护：{summary}"), if failed > 0 { "error" } else { "info" });
-            }
-            (summary, round_succeeded(refreshed, failed))
-        }
-        TASK_MODEL_REFRESH => {
-            let results = if manual {
-                crate::server::core::providers::adapter::refresh_implemented_forced(store, &serde_json::Map::new(), None).await
-            } else {
-                crate::server::core::providers::adapter::refresh_implemented(store).await
-            };
-            let count = |status: &str| results.iter().filter(|item| item["status"] == status).count();
-            let (refreshed, skipped, failed) = (count("refreshed"), count("skipped"), count("failed"));
-            // 全跳过的轮次（各家的间隔没到 / 没有可用登录态）在自动路径上是常态：
-            // 被动刷新与手动刷新会先把间隔推走，这时「成功 0 家」看着像失败，
-            // 所以这一档单独给一句话说清「本轮无事可做」。
-            let summary = if refreshed == 0 && failed == 0 {
-                format!("本轮无需刷新（跳过 {skipped} 家：未到间隔或没有可用登录态）")
-            } else {
-                format!("成功 {refreshed} 家，跳过 {skipped} 家，失败 {failed} 家")
-            };
-            // models.dev 元数据搭同一条任务（它回答的是同一件事的另一半：清单与
-            // 元数据一起才是一份能用的模型表），但**排期独立** —— 各家的目录
-            // 缓存 TTL 与它无关，一方被跳过不该连带另一方也不刷。
-            //
-            // 它的失败**不改变本任务的成败**：元数据是补充信息，为它把整轮标成
-            // 失败会连带触发凭证那套失败冷却，进而拖住真正重要的模型清单刷新；
-            // 失败原因如实写进摘要（用户看得到），这是「不静默」与「不误伤」的
-            // 折中。
-            let metadata = crate::server::core::model_meta::refresh(manual, interval_ms(task)).await;
-            let metadata_note = match metadata.get("status").and_then(Value::as_str) {
-                Some("refreshed") => format!(
-                    "；models.dev 元数据已更新 {} 条",
-                    metadata.get("count").and_then(Value::as_u64).unwrap_or(0)
-                ),
-                Some("failed") => format!(
-                    "；models.dev 元数据刷新失败（{}）",
-                    metadata.get("message").and_then(Value::as_str).unwrap_or("未知原因")
-                ),
-                // skipped（未到间隔 / 设置里关了）不写进摘要：那是常态，写进去只是噪音
-                _ => String::new(),
-            };
-            // 成败判据与凭证维护同一条（`round_succeeded`）：逐家的失败**不该**
-            // 把整轮一起罚掉。这里的失败是**按家**的 —— 一家的登录态被上游作废
-            // （CatPaw 那种长期 401）就足以让每一轮都判失败一次，于是失败计数
-            // 按指数退避一路顶到 24 小时上限，其余能刷的家跟着一起停在旧清单上，
-            // 界面上显示成「冷却中，N 小时后重试」，看起来就是刷新功能坏了。
-            // 失败的细节已经逐条写进结果与日志，不需要再把整轮也标成失败。
-            //
-            // 「一个都没成功」仍算失败：那通常意味着断网 / 出口被挡 / 上游整体
-            // 故障，保留退避才不会被原间隔反复打上游。
-            (format!("{summary}{metadata_note}"), round_succeeded(refreshed, failed))
-        }
-        _ => return Err("未知后端任务".to_string()),
-    };
-    guard.finish(success, summary.clone(), None, 0, interval_ms(task))?;
-    Ok(summary)
+    if task.id == TASK_PLUGIN_CATALOG {
+        let _ = crate::server::core::plugin_host::catalog::refresh(manual).await?;
+        return Ok("已完成社区插件检查".to_string());
+    }
+    if task.id == TASK_MAGPIE_PLUGIN {
+        let detail = crate::server::core::maintenance::tasks::execute_magpie_plugin_check(manual).await?;
+        return Ok(crate::server::core::maintenance::summary(&detail));
+    }
+    if matches!(task.id, TASK_CREDENTIAL_MAINTENANCE | TASK_MODEL_REFRESH) {
+        let detail = crate::server::core::maintenance::execute(
+            store,
+            crate::server::core::maintenance::Request::full(task.id, manual),
+        ).await?;
+        return Ok(crate::server::core::maintenance::summary(&detail));
+    }
+    Err("未知后端任务".to_string())
 }
 
 /// 调度循环：把后端任务按各自配置的间隔重复执行（由 `ServerState::bootstrap`
@@ -427,7 +430,8 @@ pub fn spawn(store: AccountStore, update: UpdateManager) {
         // 首轮先按持久化状态恢复排期：从未跑过的任务排到「现在」（于是全新安装
         // 启动即跑一次，与改造前一致），跑过的沿用「上次尝试 + 间隔」——
         // 已经到期的自然落到过去，这一轮就补上。
-        for task in TASKS.iter().filter(|task| task.runner == Runner::Backend) {
+        // 社区插件检查由 `plugin_host::catalog::spawn` 在加载完已安装插件后驱动。
+        for task in TASKS.iter().filter(|task| task.runner == Runner::Backend && task.id != TASK_PLUGIN_CATALOG) {
             if let Err(error) = task_state::reschedule(&state_key(task.id), interval_ms(task)) {
                 logging::log("[Tasks]", &format!("恢复「{}」排期失败：{error}", task.label));
             }
@@ -437,7 +441,7 @@ pub fn spawn(store: AccountStore, update: UpdateManager) {
                 tokio::time::sleep(Duration::from_millis(TICK_MS)).await;
                 continue;
             };
-            for task in TASKS.iter().filter(|task| task.runner == Runner::Backend) {
+            for task in TASKS.iter().filter(|task| task.runner == Runner::Backend && task.id != TASK_PLUGIN_CATALOG) {
                 if !settings_of(config::scheduled_settings(), task.id).enabled {
                     continue;
                 }

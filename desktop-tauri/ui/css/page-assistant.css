@@ -72,7 +72,6 @@
   font-size: 12.5px;
   cursor: pointer;
 }
-.asst-side-item:hover:not(:has([data-active])) { background: var(--nav-hover); color: var(--text); }
 .asst-side-item.active { background: var(--surface-2); color: var(--text); font-weight: 600; }
 .asst-side-item .title {
   flex: 1 1 auto;
@@ -187,8 +186,9 @@
 
 .asst-msg { display: flex; flex-direction: column; gap: 6px; }
 .asst-msg.user { align-items: flex-end; }
+.asst-msg.user > div { width: calc(100% - 34px); }
 .asst-msg.user .bubble {
-  max-width: 78%;
+  max-width: 80%;
   padding: 9px 13px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
@@ -919,5 +919,4 @@
 
 @media (max-width: 600px) {
   .asst-pill-model { max-width: 110px; }
-  .asst-msg.user .bubble { max-width: 88%; }
 }

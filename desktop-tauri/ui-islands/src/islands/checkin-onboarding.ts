@@ -1,9 +1,10 @@
 import { t } from '../i18n'
 import { bridgeApi, errorMessage, loadCenter, patch, store, toast, type OnboardingCache } from './checkin-store'
-import { normalizeOnboardingTasks } from './checkin-onboarding-cache'
+import { currentOnboardingCache, normalizeOnboardingTasks } from './checkin-onboarding-cache'
 
 export function onboardingOf(id: string): OnboardingCache {
-  return store.onboarding.get(id) ?? {
+  const provider = store.center?.extras.onboarding.find(row => row.id === id)?.provider
+  return currentOnboardingCache(provider, store.onboarding.get(id)) ?? {
     status: 'idle', tasks: [], earned: 0, claiming: false, settled: false,
   }
 }
@@ -15,7 +16,7 @@ function patchOnboarding(id: string, next: Partial<OnboardingCache>): void {
 }
 
 /** 手动查询可强制刷新；批量查询跳过已结清的账号。 */
-export async function queryOnboarding(id: string, refresh = false): Promise<void> {
+export async function queryOnboarding(id: string, refresh = false, reload = true): Promise<void> {
   const cached = onboardingOf(id)
   if (cached.status === 'loading' || cached.claiming) return
   if (!refresh && cached.settled) return
@@ -31,13 +32,47 @@ export async function queryOnboarding(id: string, refresh = false): Promise<void
       settledAt: Number(data.settledAt) || undefined,
       checkedAt: Date.now(),
     })
-    await loadCenter()
+    if (reload) await loadCenter(true)
   } catch (error) {
     patchOnboarding(id, { status: 'error', error: errorMessage(error) })
   }
 }
 
-export async function claimOnboarding(id: string): Promise<void> {
+export async function queryOnboardingBatch(accountIds: string[]): Promise<void> {
+  if (store.onboardingBatch) return
+  const ids = [...new Set(accountIds)]
+  patch({ onboardingBatch: ids })
+  try {
+    await Promise.all(ids.map(id => queryOnboarding(id, false, false)))
+  } finally {
+    await loadCenter(true)
+    patch({ onboardingBatch: null })
+  }
+}
+
+export function onboardingClaimable(id: string): boolean {
+  const cache = onboardingOf(id)
+  if (cache.status !== 'loaded' || cache.claiming || cache.settled) return false
+  const provider = store.center?.extras.onboarding.find(row => row.id === id)?.provider
+  return provider === 'officeace' || cache.tasks.some(task => !task.done && !task.blocked)
+}
+
+export async function claimOnboardingBatch(accountIds: string[]): Promise<void> {
+  if (store.onboardingBatch) return
+  const ids = [...new Set(accountIds)].filter(onboardingClaimable)
+  if (ids.length === 0) return
+  patch({ onboardingBatch: ids })
+  try {
+    for (const id of ids) {
+      if (onboardingClaimable(id)) await claimOnboarding(id, false)
+    }
+  } finally {
+    await loadCenter(true)
+    patch({ onboardingBatch: null })
+  }
+}
+
+export async function claimOnboarding(id: string, reload = true): Promise<void> {
   const cached = onboardingOf(id)
   if (cached.status !== 'loaded' || cached.claiming || cached.settled) return
   patchOnboarding(id, { claiming: true, error: '' })
@@ -54,13 +89,13 @@ export async function claimOnboarding(id: string): Promise<void> {
       settledAt: Number(data.settledAt) || undefined,
       checkedAt: Date.now(),
     })
-    await loadCenter()
+    if (reload) await loadCenter(true)
     const message = typeof data.message === 'string' ? data.message.trim() : ''
     toast(message || (failed > 0
       ? t('新手福利领取失败 {n} 项', { n: failed })
       : t('✅ 新手福利领取完成')), failed > 0 ? 'err' : 'ok')
   } catch (error) {
-    patchOnboarding(id, { claiming: false })
+    patchOnboarding(id, { claiming: false, status: 'error', error: errorMessage(error) })
     toast(t('领取失败：{error}', { error: errorMessage(error) }), 'err')
   }
 }

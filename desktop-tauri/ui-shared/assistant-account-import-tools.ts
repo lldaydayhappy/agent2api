@@ -24,6 +24,7 @@
  */
 
 import { assistantFileOf, jsonTopLevelKeys } from './assistant-files'
+import { accountImportNotice } from './account-import-result'
 import type { ImageToolContext } from './assistant-image-tools'
 import type { Translate } from './assistant-read-types'
 
@@ -34,7 +35,7 @@ const READ_DEFAULT = 20_000
 const READ_MAX = 40_000
 
 /** 模型侧的一段提示：不认识的提供商时可以照着问用户 */
-const PROVIDER_HINT = 'workbuddy / workbuddy-intl（WorkBuddy）、raccoon（小浣熊）、catpaw、autoclaw / autoclaw-intl、cline-free / cline-pass、zcode / zcode-intl、loomy、commandcode、officeace、orcaterm、chatglm（智谱清言）、modelscope / modelscope-intl、atomcode、doubaowork（豆包工作）、deepseek-web'
+const PROVIDER_HINT = 'workbuddy / workbuddy-intl（WorkBuddy）、raccoon（小浣熊）、catpaw、autoclaw / autoclaw-intl、cline-free、zcode / zcode-intl、loomy、commandcode、officeace、orcaterm、chatglm（智谱清言）、modelscope / modelscope-intl、atomcode、doubaowork（豆包工作）、deepseek-web'
 
 export type AccountImportApi = {
   /** 发一条管理请求（桌面与手机各自注入，见两端的工具表） */
@@ -279,9 +280,12 @@ export function createAccountImportTool(api: AccountImportApi, t: Translate): Ac
         const skipped = num(row.skipped) ?? 0
         const total = num(row.total) ?? accounts.length
         const errors = Array.isArray(row.errors) ? row.errors.slice(0, 5) : []
+        const notice = accountImportNotice(row)
         api.refresh?.()
         return {
-          text: JSON.stringify({ ok: failed === 0, total, added, updated, skipped, failed, errors }),
+          text: JSON.stringify({ ok: failed === 0, total, added, updated, skipped, failed, errors,
+            ...(notice ? { importNotice: notice.text, subscriptionWarning: notice.warning } : {}),
+          }),
           summary: t('批量导入：新增 {added}、更新 {updated}、失败 {failed}', {
             added: String(added), updated: String(updated), failed: String(failed),
           }),
@@ -323,6 +327,7 @@ export function createAccountImportTool(api: AccountImportApi, t: Translate): Ac
       const accountId = account ? str(account.id) : ''
       const accountName = account ? str(account.name) : ''
       const providerOut = account ? str(account.provider) || provider : provider
+      const notice = accountImportNotice(row)
       api.refresh?.()
       return {
         text: JSON.stringify({
@@ -330,6 +335,7 @@ export function createAccountImportTool(api: AccountImportApi, t: Translate): Ac
           provider: providerOut,
           created: row.created !== false,
           account: { id: accountId, name: accountName, provider: providerOut },
+          ...(notice ? { importNotice: notice.text, subscriptionWarning: notice.warning } : {}),
         }),
         summary: t('已导入账号「{name}」', {
           name: accountName || accountId || providerOut,

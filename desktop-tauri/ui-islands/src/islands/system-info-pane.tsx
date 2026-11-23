@@ -12,6 +12,7 @@ import {
 import { t } from '../i18n'
 import { openExternal } from './update-shared'
 import { updateUnavailableReason } from '../../../ui-shared/updates'
+import { ThirdPartyLicensesButton } from '../../../ui-shared/settings-third-party-licenses'
 
 /**
  * 设置页「版本信息」面板（React 岛）。
@@ -262,7 +263,6 @@ function toPlainText(info: SystemInfo): string {
     [t('/v1 拒绝无 Key 请求'), onOff(security.v1FailClosed)],
     [t('未注册闸门'), onOff(security.panelGate)],
     [t('允许无 Key 裸跑'), onOff(security.allowNoKey)],
-    [t('GitHub 令牌'), security.githubTokenFilled ? t('已填写') : t('未填写')],
     [t('更新出网线路'), security.updateProxy ? t('已指定出口') : t('直连')],
   ])
   section(t('开关'), [
@@ -270,6 +270,7 @@ function toPlainText(info: SystemInfo): string {
     [t('指纹脱敏'), onOff(features.sanitizeFingerprints)],
     [t('跨域访问'), onOff(features.cors)],
     [t('开发者角色兼容'), onOff(features.developerRoleCompat)],
+    [t('第三方模型回答完自动折叠过程'), onOff(features.thirdPartyReasoningCollapse)],
     [t('保活换行丢弃'), onOff(features.keepaliveStrip)],
     [t('自动续写'), onOff(features.autoContinue)],
     [t('models.dev 元数据'), onOff(features.modelsDev)],
@@ -438,7 +439,6 @@ function SystemInfoPanel() {
         [t('/v1 拒绝无 Key 请求'), onOff(security.v1FailClosed)],
         [t('未注册闸门'), onOff(security.panelGate)],
         [t('允许无 Key 裸跑'), onOff(security.allowNoKey)],
-        [t('GitHub 令牌'), security.githubTokenFilled ? t('已填写') : t('未填写')],
         [t('更新出网线路'), security.updateProxy ? t('已指定出口') : t('直连')],
       ],
     },
@@ -449,6 +449,7 @@ function SystemInfoPanel() {
         [t('指纹脱敏'), onOff(features.sanitizeFingerprints)],
         [t('跨域访问'), onOff(features.cors)],
         [t('开发者角色兼容'), onOff(features.developerRoleCompat)],
+        [t('第三方模型回答完自动折叠过程'), onOff(features.thirdPartyReasoningCollapse)],
         [t('保活换行丢弃'), onOff(features.keepaliveStrip)],
         [t('自动续写'), features.autoContinue
           ? t('开（最多 {n} 轮）', { n: text(features.autoContinueMaxRounds) })
@@ -509,6 +510,7 @@ function SystemInfoPanel() {
             <Button variant='outline' size='xs' onClick={() => void openExternal(
               app.sourceUrl || 'https://github.com/aimod-cc/Agent2API',
             )}>{t('源代码')}</Button>
+            <ThirdPartyLicensesButton t={t} openExternal={openExternal} />
           </div>
           <p className='mt-1.5 text-[12px] text-subtle'>
             {t('本软件不提供任何担保，可按 AGPL-3.0 修改与分发；通过网络提供修改版服务时须向用户提供对应源码。')}

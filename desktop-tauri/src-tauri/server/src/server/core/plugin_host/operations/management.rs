@@ -6,6 +6,7 @@ use crate::server::core::plugin_host::{self, install::PackRegistry, switching::C
 use crate::server::errors::GatewayError;
 
 pub enum PackChange {
+    Reload,
     Uninstall,
     Enabled(bool),
     Provider { id: String, enabled: bool },
@@ -26,26 +27,61 @@ async fn apply(id: &str, change: PackChange) -> Result<Value, GatewayError> {
     let mut after = before.clone();
     let pack = after.packs.iter_mut().find(|pack| pack.id == id)
         .ok_or_else(|| GatewayError::with_status(404, "没有安装这个插件包"))?;
+    if matches!(&change, PackChange::Reload | PackChange::Enabled(true) | PackChange::Provider { enabled: true, .. }) {
+        if let Some(reason) = plugin_host::ownership::unavailable_reason(pack) {
+            return Err(GatewayError::with_status(409, reason));
+        }
+        if let Some(reason) = plugin_host::compatibility::installed_error(pack) {
+            return Err(GatewayError::with_status(409, reason));
+        }
+    }
     match &change {
+        PackChange::Reload => {
+            if !pack.enabled { return Err(GatewayError::bad_request("插件已停用，请先启用后再重新加载")); }
+            if plugin_host::startup::status(id).is_some_and(|status| status.phase.pending()) {
+                return Err(GatewayError::with_status(409, "插件仍在加载，请等待当前启动完成"));
+            }
+            if plugin_host::startup::status(id).is_some_and(|status| status.phase == plugin_host::startup::Phase::Ready) {
+                return Ok(plugin_host::management_snapshot());
+            }
+        }
         PackChange::Uninstall => after.packs.retain(|pack| pack.id != id),
-        PackChange::Enabled(enabled) => pack.enabled = *enabled,
+        PackChange::Enabled(enabled) => {
+            pack.enabled = *enabled;
+            if let Some(provider_id) = pack.single_provider_id().map(str::to_string) {
+                if pack.providers.get(&provider_id) == Some(&false) {
+                    pack.providers.insert(provider_id, true);
+                }
+            }
+        }
         PackChange::Provider { id, enabled } => {
             if !pack.manifest_providers.iter().any(|provider| provider.id.as_str() == id) {
                 return Err(GatewayError::bad_request("这个插件包里没有指定的提供商"));
             }
-            pack.providers.insert(id.clone(), *enabled);
+            if let Some(owner) = plugin_host::ownership::overridden_by(&plugin_host::ownership::owners(&before), &pack.id, id) {
+                return Err(GatewayError::with_status(409,
+                    format!("该提供商已由插件 {owner} 接管，请到对应插件中管理")));
+            }
+            if pack.single_provider_id() == Some(id.as_str()) {
+                pack.enabled = *enabled;
+                pack.providers.insert(id.clone(), true);
+            } else {
+                pack.providers.insert(id.clone(), *enabled);
+            }
         }
     }
     let scope = ChangeScope::between(&before, &after, id, None);
     let switch = scope.begin().ok_or_else(|| GatewayError::with_status(
         409, "插件仍有在途请求、登录或后台任务，未执行变更，请稍后重试",
     ))?;
+    let _change = plugin_host::packages::provenance::begin_scope_change(&scope.packs, id);
     if let Err(error) = scope.stop().await {
         let _ = scope.start(&store).await;
         return Err(GatewayError::with_status(503, error));
     }
     switch.clear_adapters();
     let outcome = match change {
+        PackChange::Reload => Ok(()),
         PackChange::Uninstall => {
             let id = id.to_string();
             tokio::task::spawn_blocking(move || plugin_host::uninstall(&id)).await

@@ -161,21 +161,10 @@ pub fn is_rate_limited(account: &Value, keys: &CooldownKeys<'_>, now: i64) -> bo
 /// 冷却键按 [`CooldownKeys`] 解析（真名，不是请求名）。
 pub fn rate_limit_reset_at(account: &Value, keys: &CooldownKeys<'_>, now: i64) -> i64 {
     let key = keys.for_account(account);
-    let Some(limit) = account
-        .get("rateLimits")
-        .and_then(|limits| limits.get(key.as_str()))
-    else {
-        return 0;
-    };
-    let reset_at = limit
-        .get("resetAt")
-        .and_then(js_number)
-        .unwrap_or(0.0);
-    if reset_at > now as f64 {
-        reset_at as i64
-    } else {
-        0
-    }
+    let keys = [account.pointer("/routingCooldowns/@account/resetAt"), account.pointer("/providerCooldown/resetAt"),
+        account.get("rateLimits").and_then(|limits| limits.get(key.as_str())).and_then(|limit| limit.get("resetAt"))];
+    keys.into_iter().flatten().filter_map(js_number).filter(|reset| *reset > now as f64)
+        .map(|reset| reset as i64).max().unwrap_or(0)
 }
 
 /// 账号是否可用于转发：启用 + 未被该模型限额。
@@ -188,6 +177,9 @@ pub fn account_usability(account: &Value, keys: &CooldownKeys<'_>, now: i64) -> 
     }
     if is_rate_limited(account, keys, now) {
         return AccountUsability { usable: false, reason: Some("rate-limited") };
+    }
+    if super::plugin_host::wasm::catalog::route_allowed(account, &keys.for_account(account)) == Some(false) {
+        return AccountUsability { usable: false, reason: Some("account-model-unavailable") };
     }
     AccountUsability { usable: true, reason: None }
 }
@@ -226,11 +218,7 @@ pub fn max_concurrent_of(account: &Value) -> u64 {
 /// 其他账号。没有运行时计数可拿的调用方传**空表** = 不做并发过滤（见
 /// `pick_for_model` / `describe_route_decision` 的说明）。
 ///
-/// ── 并发上限是**软上限**（选路与 rebind 之间的微小窗口）────────
-/// 两个并发请求可能在同一瞬间选中同一个账号、然后各自 +1 —— 期间谁都还
-/// 读不到对方的计数。为此引入额外加锁不值得：超出的那 1-2 个请求只意味着
-/// 短暂超载（请求结束计数立刻回落），而选路必须是「读一次快照、立刻决策」
-/// 的廉价操作。把这个口径写明：**允许短暂超 1-2 个，不做强一致**。
+/// 在途快照用于快速筛选；实际发送前还会原子预占账号名额，不能超额发送。
 ///
 /// 排序取首位即为唯一答案（优先级唯一由写入侧保证）；并列属手工编辑出来的
 /// 异常数据，按加入时间兜底，结果依旧稳定。
@@ -676,12 +664,12 @@ pub fn plan_route(
         }
         let reset_at = rate_limit_reset_at(account, keys, now);
         if reset_at > 0 {
+            let scope = if account.pointer("/providerCooldown/resetAt").and_then(Value::as_i64).unwrap_or(0) == reset_at { "提供商" }
+                else if account.pointer("/routingCooldowns/@account/resetAt").and_then(Value::as_i64).unwrap_or(0) == reset_at { "账号" }
+                else { "该账号的当前模型" };
             blocked.push(entry(
                 "cooldown",
-                format!(
-                    "对该模型限流冷却中，{} 恢复（恢复后自动回来）",
-                    clock_text(reset_at, now)
-                ),
+                format!("{scope}冷却中，{} 恢复（恢复后自动回来）", clock_text(reset_at, now)),
             ));
             continue;
         }
@@ -695,8 +683,16 @@ pub fn plan_route(
             ));
             continue;
         }
+        if super::plugin_host::wasm::catalog::route_allowed(account, &keys.for_account(account)) == Some(false) {
+            blocked.push(entry("model-permission", "当前账号没有该模型的使用权限".into()));
+            continue;
+        }
         if matches!(account.get("hasCredentials"), Some(Value::Bool(false))) {
             blocked.push(entry("no-credentials", "没有可用凭证，登录后才能接请求".to_string()));
+            continue;
+        }
+        if meta.open.contains(&id) {
+            blocked.push(entry("breaker", "连续失败保护中，到保护结束后才允许重新尝试".to_string()));
             continue;
         }
         ordered.push(account.clone());
@@ -811,10 +807,13 @@ pub fn plan_route(
                     }
                 }
             };
-            if meta.sunk.contains_key(&id) {
-                // 文案跟着 `route_state::SINK_TTL_MS` 走：垫底现在有 30 分钟寿命，
-                // 不再是「轮一圈才回来」（那句是上游原实现的说法，那时垫底永不失效）。
-                reason.push_str("；曾还有额度时被 429（垫底中，30 分钟后自动回到队列）");
+            if let Some(&until) = meta.sunk.get(&id) {
+                let text = clock_text(until, now);
+                if text.is_empty() {
+                    reason.push_str("；优先级已调至最低（成功一次自动恢复）");
+                } else {
+                    reason.push_str(&format!("；优先级已调至最低（{text} 后自动恢复，成功一次提前恢复）"));
+                }
             }
             if let Some(until) = meta.resting.get(&id) {
                 reason.push_str(&format!("；转发失败休息至 {}", clock_text(*until, now)));

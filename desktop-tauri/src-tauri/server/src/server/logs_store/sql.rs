@@ -36,8 +36,11 @@ pub(super) fn select_all_asc(conn: &Connection) -> rusqlite::Result<Vec<LogEntry
     let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM logs ORDER BY id ASC"))?;
     let mut rows = stmt.query([])?;
     let mut entries = Vec::new();
+    let names = crate::server::core::plugin_host::startup::log_names();
     while let Some(row) = rows.next()? {
-        entries.push(decode_row(row)?);
+        let mut entry = decode_row(row)?;
+        super::plugin_events::enrich(&mut entry, &names);
+        entries.push(entry);
     }
     Ok(entries)
 }
@@ -83,7 +86,8 @@ impl FilterPlan {
         //     的 matches 会再滤一次），所以 SQL 只做「排除 debug」。
         //   · debug 视图不下推 —— 旧插件那批 info 行读出来才改判 debug，
         //     SQL 先按 level='debug' 过滤会漏掉它们。
-        //   · warn / error 只会从 info 改判出来，不会从 warn/error 改走，精确。
+        //   · warn / error 同样是超集（历史误判成 error 的账号配置变更会在
+        //     `prepare` 还原为 info，再由 Rust 侧 matches 滤掉）。
         match query.view {
             LogView::Important => fragments.push("level <> 'debug'"),
             LogView::Debug | LogView::All => {}
@@ -187,8 +191,10 @@ pub(super) fn select_matching_desc(
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(plan.binds.iter()))?;
     let mut entries = Vec::new();
+    let names = crate::server::core::plugin_host::startup::log_names();
     while let Some(row) = rows.next()? {
-        let entry = decode_row(row)?;
+        let mut entry = decode_row(row)?;
+        super::plugin_events::enrich(&mut entry, &names);
         if plan.matches(&entry) {
             entries.push(entry);
         }

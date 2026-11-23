@@ -1,5 +1,7 @@
 /** 桌面与移动端共用的动态登录元数据解析；只消费网关投影，不执行 provider。 */
 import { t } from '../i18n'
+import { pluginLoginText } from './add-account-login-text'
+export { mergeLoginInstructions, pluginBrowserInstructions } from './add-account-login-text'
 
 export type Prompt = {
   key: string
@@ -15,12 +17,34 @@ export type Prompt = {
 
 export type CallbackInput = 'url' | 'code'
 
+export type SmsConfig = {
+  phoneLabel: string
+  phonePlaceholder: string
+  countryCodes: Array<{ value: string; label: string }>
+  phoneMinLength: number
+  phoneMaxLength: number
+  codeMinLength: number
+  codeMaxLength: number
+  resendAfterSeconds: number
+  expiresAfterSeconds: number
+}
+
+export type CredentialFile = {
+  field: string
+  accept: string
+  maxBytes: number
+  binary: boolean
+}
+
 export type Method = {
   id: string
-  type: 'oauth' | 'api' | 'manual' | 'desktop' | 'guest' | 'unsupported'
+  file?: CredentialFile
+  type: 'oauth' | 'api' | 'sms' | 'desktop'
+  sms?: SmsConfig
   label: string
-  methodIndex?: number
+  methodIndex: number
   prompts: Prompt[]
+  dynamicPrompts?: boolean
   localOnly: boolean
   manualCallback: boolean
   /**
@@ -28,13 +52,15 @@ export type Method = {
    * 地址上的 AStudio）。为真时界面不提供「系统浏览器」选项。
    */
   embeddedOnly: boolean
+  desktopOnly?: boolean
+  browserMode?: 'choice' | 'external' | 'plugin' | 'none'
   callbackInput: CallbackInput
   instructions: string
   reason?: string
 }
 
 export type MethodsState = {
-  phase: 'loading' | 'ready' | 'legacy' | 'error'
+  phase: 'loading' | 'ready' | 'error'
   methods: Method[]
   instructions: string
   reason: string
@@ -48,7 +74,7 @@ const objectOf = (value: unknown): Record<string, unknown> | undefined =>
 /** 元数据与进度共用翻译；设备码只作为模板参数，不改动授权内容。 */
 export function loginText(value: unknown): string {
   const text = textOf(value)
-  const translated = t(text)
+  const translated = pluginLoginText(text)
   if (translated !== text) return translated
   return text.split('\n').map(line => {
     const deviceCode = /^在 GitHub 输入设备码 (.+)，核对账号与授权权限。设备码过期后需要重新发起登录。$/.exec(line)
@@ -57,11 +83,11 @@ export function loginText(value: unknown): string {
     if (project) return project[1]
       ? t('Google Cloud Project ID（必填，Standard / Enterprise 资格由上游判定）；默认候选来自 {variable}，请明确确认', { variable: project[1] })
       : t('Google Cloud Project ID（必填，Standard / Enterprise 资格由上游判定）')
-    return t(line)
+    return pluginLoginText(line)
   }).join('\n')
 }
 
-function parsePrompt(value: unknown): Prompt {
+export function parsePrompt(value: unknown): Prompt {
   const prompt = objectOf(value)
   const key = textOf(prompt?.key)
   if (!prompt || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(key) || UNSAFE_KEYS.has(key)
@@ -77,7 +103,7 @@ function parsePrompt(value: unknown): Prompt {
       if (!option || !value || options.some(item => item.value === value)) {
         throw new Error(t('插件登录选择字段包含无效或重复的选项'))
       }
-      options.push({ value, label: t(textOf(option.label) || value) })
+      options.push({ value, label: loginText(textOf(option.label) || value) })
     }
   }
   const condition = objectOf(prompt.when)
@@ -103,6 +129,50 @@ export function parseCallbackInput(value: unknown): CallbackInput {
   throw new Error(t('插件返回了无效的登录方式，请更新插件或联系作者'))
 }
 
+function parseSms(value: unknown): SmsConfig {
+  const raw = objectOf(value)
+  const integer = (key: string, min: number, max: number): number => {
+    const value = raw?.[key]
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min || value > max) {
+      throw new Error(t('插件返回的短信登录声明无效'))
+    }
+    return value
+  }
+  if (!raw || typeof raw.phoneLabel !== 'string' || !raw.phoneLabel.trim() || !Array.isArray(raw.countryCodes)) {
+    throw new Error(t('插件返回的短信登录声明无效'))
+  }
+  const countryCodes: SmsConfig['countryCodes'] = []
+  for (const item of raw.countryCodes) {
+    const code = objectOf(item)
+    if (!code || typeof code.value !== 'string' || !/^\d{1,6}$/.test(code.value)
+      || typeof code.label !== 'string' || !code.label.trim() || countryCodes.some(item => item.value === code.value)) {
+      throw new Error(t('插件返回的短信登录声明无效'))
+    }
+    countryCodes.push({ value: code.value, label: loginText(code.label) })
+  }
+  const phoneMinLength = integer('phoneMinLength', 1, 32)
+  const codeMinLength = integer('codeMinLength', 1, 16)
+  return {
+    phoneLabel: loginText(raw.phoneLabel), phonePlaceholder: loginText(raw.phonePlaceholder), countryCodes,
+    phoneMinLength, phoneMaxLength: integer('phoneMaxLength', phoneMinLength, 32),
+    codeMinLength, codeMaxLength: integer('codeMaxLength', codeMinLength, 16),
+    resendAfterSeconds: integer('resendAfterSeconds', 1, 3600), expiresAfterSeconds: integer('expiresAfterSeconds', 30, 900),
+  }
+}
+
+function parseUnavailableReason(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined
+  const valid = (text: string) => text.trim().length > 0
+    && new TextEncoder().encode(text).length <= 8192
+    && !/[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/.test(text)
+  if (typeof value !== 'string' || !valid(value)) {
+    throw new Error(t('插件返回了无效的登录方式，请更新插件或联系作者'))
+  }
+  const reason = loginText(value.trim())
+  if (!valid(reason)) throw new Error(t('插件返回了无效的登录方式，请更新插件或联系作者'))
+  return reason
+}
+
 export function parseMethods(value: unknown, provider = ''): MethodsState {
   const data = objectOf(value)
   if (!data || !Array.isArray(data.methods)) {
@@ -113,7 +183,7 @@ export function parseMethods(value: unknown, provider = ''): MethodsState {
     const raw = objectOf(value)
     const index = raw?.methodIndex
     if (!raw || typeof index !== 'number' || !Number.isSafeInteger(index) || index < 0
-      || indexes.has(index) || (raw.type !== 'oauth' && raw.type !== 'api') || !Array.isArray(raw.prompts)) {
+      || indexes.has(index) || !['oauth', 'api', 'sms', 'desktop'].includes(String(raw.type)) || !Array.isArray(raw.prompts)) {
       throw new Error(t('插件返回了无效的登录方式，请更新插件或联系作者'))
     }
     indexes.add(index)
@@ -126,27 +196,51 @@ export function parseMethods(value: unknown, provider = ''): MethodsState {
     }
     if ((raw.manualCallback !== undefined && typeof raw.manualCallback !== 'boolean')
       || (raw.localOnly !== undefined && typeof raw.localOnly !== 'boolean')
-      || (raw.embeddedOnly !== undefined && typeof raw.embeddedOnly !== 'boolean')) {
+      || (raw.embeddedOnly !== undefined && typeof raw.embeddedOnly !== 'boolean')
+      || (raw.desktopOnly !== undefined && typeof raw.desktopOnly !== 'boolean')
+      || (raw.browserMode !== undefined && !['choice', 'external', 'plugin', 'none'].includes(String(raw.browserMode)))) {
       throw new Error(t('插件返回了无效的登录方式，请更新插件或联系作者'))
     }
     const callbackInput = parseCallbackInput(raw.callbackInput)
     const manualCallback = raw.manualCallback === true
     const embeddedOnly = raw.embeddedOnly === true
+    const sms = raw.type === 'sms' ? parseSms(raw.sms) : undefined
+    if (sms && (raw.localOnly === true || manualCallback || embeddedOnly || raw.desktopOnly === true
+      || raw.dynamicPrompts === true || prompts.length > 0 || raw.browserMode !== 'none')
+      || !sms && raw.sms !== undefined) {
+      throw new Error(t('插件返回的短信登录声明无效'))
+    }
+    if (raw.type === 'desktop' && (raw.localOnly !== true || raw.browserMode !== 'none' || manualCallback || embeddedOnly || prompts.length > 0)) {
+      throw new Error(t('插件返回了无效的登录方式，请更新插件或联系作者'))
+    }
     if ((callbackInput === 'code' && !manualCallback)
       || (raw.type === 'api' && (raw.localOnly === true || manualCallback || embeddedOnly))) {
       throw new Error(t('插件返回了无效的登录方式，请更新插件或联系作者'))
     }
+    const file = objectOf(raw.file)
+    if (raw.file !== undefined && (!file || raw.type !== 'api' || raw.dynamicPrompts === true
+      || typeof file.field !== 'string' || typeof file.accept !== 'string' || file.accept.length > 512
+      || typeof file.binary !== 'boolean' || typeof file.maxBytes !== 'number' || !Number.isSafeInteger(file.maxBytes)
+      || file.maxBytes <= 0 || file.maxBytes > (file.binary ? 32 * 1024 * 1024 : 262144)
+      || !prompts.some(prompt => prompt.key === file.field && prompt.type === 'text' && !prompt.when))) {
+      throw new Error(t('插件凭据文件声明无效'))
+    }
     const callbackContractMissing = provider === 'copilot-subscription' && index === 1
       && (!manualCallback || callbackInput !== 'code')
+    let browserMode = raw.browserMode as Method['browserMode']
+    if (raw.type === 'oauth' && !embeddedOnly && ['intern-inkstone', 'mclaw'].includes(provider)
+      && (!browserMode || browserMode === 'choice')) browserMode = 'plugin'
     return {
-      id: `method:${index}`, methodIndex: index, type: raw.type,
-      label: t(textOf(raw.label) || (raw.type === 'oauth' ? t('OAuth 登录') : t('API 凭证'))),
-      prompts, localOnly: raw.localOnly === true, manualCallback, callbackInput, embeddedOnly,
+      id: `method:${index}`, methodIndex: index, type: raw.type as Method['type'], sms,
+      ...(file ? { file: { field: String(file.field), accept: String(file.accept), maxBytes: Number(file.maxBytes), binary: file.binary === true } } : {}),
+      label: loginText(textOf(raw.label) || (raw.type === 'oauth' ? t('OAuth 登录') : raw.type === 'sms' ? t('手机验证码登录') : t('API 凭证'))),
+      prompts, dynamicPrompts: raw.dynamicPrompts === true, localOnly: raw.localOnly === true, manualCallback, callbackInput, embeddedOnly,
+      desktopOnly: raw.desktopOnly === true, browserMode,
       instructions: loginText(raw.instructions),
-      reason: callbackContractMissing
+      reason: parseUnavailableReason(raw.unavailableReason) ?? (callbackContractMissing
         ? t('此 Copilot 手动令牌方式未声明回调输入契约，暂不发起；请改用设备码登录或只读本机引用。')
         : prompts.some(prompt => prompt.type === 'select' && !prompt.options.length)
-          ? t('该登录方式没有可选项，无法提交；请更新插件或联系作者') : undefined,
+          ? t('该登录方式没有可选项，无法提交；请更新插件或联系作者') : undefined),
     }
   })
   return {
@@ -156,6 +250,7 @@ export function parseMethods(value: unknown, provider = ''): MethodsState {
 }
 
 export function methodLabel(method: Method): string {
+  if (method.localOnly && method.browserMode === 'none') return method.label
   if (method.localOnly) return t('{label}（只读本机）', { label: method.label })
   return method.type === 'oauth' ? t('{label}（OAuth）', { label: method.label })
     : method.type === 'api' ? t('{label}（API）', { label: method.label }) : method.label

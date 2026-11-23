@@ -2,22 +2,28 @@ import * as React from 'react'
 import { mountOnPage } from '../island-lazy'
 import { createRoot } from 'react-dom/client'
 import {
-  Badge, Button, Checkbox, InputGroup, InputGroupAddon, InputGroupInput, NavList, NavItem,
+  Badge, Button, Checkbox, InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput, NavList, NavItem,
   SegmentedControl, cn, TableCell, TableRow, Card, CardHeader, ResponsiveSheet,
   Table, TableHeader, TableHead, TableBody, Sidebar, Empty,
 } from '@ui'
 import { TableFooter, useClientPaging } from './table-shell'
 import { CapabilityDialog } from './model-capability-dialog'
+import { ModelPricingDialog, type ModelPricingContext } from './model-pricing-dialog'
+import { ProviderPricingDialog, type ProviderPricingContext } from './provider-pricing-dialog'
+import {
+  loadPricingSettings, switchDisplayCurrency, updateCachedDisplay, usePricingDisplay,
+  type ModelPricingSettings,
+} from './model-pricing'
 import { ModelTestDialog, type ModelTestTarget } from './model-test-dialog'
 import { ModelBatchDialog } from './models-batch-dialog'
-import { CompactRoutesDialog } from './models-compact-dialog'
 import { ModelCell } from './models-cells'
 import { MappingDialog, CustomModelDialog } from './models-dialogs'
 import { DanglingMappings } from './models-dangling'
 import * as customSource from './models-custom-source'
 import { ALL_CUSTOM, type ManageModel } from './models-custom-source'
-import { PROVIDER_ICONS } from './add-provider-pick'
+import { useProviderIcon } from './provider-icon'
 import { providerPresetIconOf } from './add-provider-metadata'
+import { openProviderSettings } from './settings-providers'
 import {
   GROUP_LIMIT, MODEL_STATE_OPTIONS, MODEL_VISIBILITY_OPTIONS, builtinRailCounts,
   closeCapability, closeCustomModel, closeMapping, collapseGroup, customRailItems, directoryReady,
@@ -68,7 +74,7 @@ const PROVIDER_HUES: Record<string, number> = {
   workbuddy: 250, 'workbuddy-intl': 295,
   raccoon: 60, catpaw: 85,
   autoclaw: 250, 'autoclaw-intl': 295,
-  qoder: 330, 'qoder-intl': 350, 'cline-free': 200, 'cline-pass': 200,
+  qoder: 330, 'qoder-intl': 350, 'cline-free': 200,
   // 千问办公两版（与 Qoder 同一套协议栈的另一家产品）：手工给一对
   // 相邻但可辨的色相，而不是让未登记 id 落到哈希上（那种颜色是随机的）。
   qwenwork: 300, 'qwenwork-intl': 315,
@@ -106,22 +112,18 @@ const GRID_GLYPH = (
   </svg>
 )
 
-function providerIconOf(id: string): string {
-  if (customSource.isCustom(id)) return providerPresetIconOf(id)
-  return PROVIDER_ICONS[id === 'workbuddy-intl' ? 'workbuddy' : id] || ''
-}
-
 /** 左栏 / 标题共用的头像节点（glyph 传 ReactNode 时直接渲染，如「全部」的网格）。
     有真实图标（内置家 / 带模板标识的自定义家）用 <img>（.img 形态，中性底），
     否则回落色相 monogram；两颗「全部」（内置 / 自定义组各自的聚合哨兵）都不是一家，
     挂 .mute 走中性灰，不参与色环。 */
-function providerAvatar(id: string, label: string, glyph?: React.ReactNode): React.ReactNode {
-  const icon = glyph ? '' : providerIconOf(id)
+function ProviderAvatar({ id, label, glyph }: { id: string; label: string; glyph?: React.ReactNode }): React.ReactNode {
+  const { src: icon, onError } = useProviderIcon(glyph ? '' : id,
+    glyph ? '' : customSource.isCustom(id) ? providerPresetIconOf(id) : undefined)
   const sentinel = id === 'all' || id === ALL_CUSTOM
   return (
     <span className={cn('pv-ico', sentinel && 'mute', icon && 'img')}
       style={icon ? undefined : avatarStyle(id)} aria-hidden='true'>
-      {icon ? <img src={icon} alt='' /> : (glyph ?? providerGlyph(label))}
+      {icon ? <img src={icon} alt='' onError={onError} /> : (glyph ?? providerGlyph(label))}
     </span>
   )
 }
@@ -147,6 +149,8 @@ function matches(model: ManageModel, keyword: string, provider: string, stateFil
 function ModelsPage() {
   const state = React.useSyncExternalStore(subscribe, getSnapshot)
   const provider = resolveProvider(state)
+  const [providerSearch, setProviderSearch] = React.useState('')
+  const providerSearchRef = React.useRef<HTMLInputElement>(null)
   /** 当前视图是不是自定义侧（单家或「自定义 · 全部」聚合都算 —— 列隐藏 / 页脚说明同一口径） */
   const custom = customSource.isCustom(provider) || provider === ALL_CUSTOM
   /**
@@ -155,9 +159,12 @@ function ModelsPage() {
    * 放在组件里就够了。值为 null = 弹窗关着。
    */
   const [testTarget, setTestTarget] = React.useState<ModelTestTarget | null>(null)
+  const [pricingTarget, setPricingTarget] = React.useState<ModelPricingContext | null>(null)
+  const [providerPricingTarget, setProviderPricingTarget] = React.useState<ProviderPricingContext | null>(null)
+  const [pricingSettings, setPricingSettings] = React.useState<ModelPricingSettings | null>(null)
+  const pricingDisplay = usePricingDisplay()
   /** 批量操作的弹窗开关（勾选若干行后由表头旁按钮打开） */
   const [batchOpen, setBatchOpen] = React.useState(false)
-  const [compactOpen, setCompactOpen] = React.useState(false)
   /**
    * 批量勾选的行集合（`rowKeyOf` 键 = provider:id，跨提供商天然不撞）。
    * 刻意**不进模块快照**：只有本页读它，没有从 React 之外打开的调用点 ——
@@ -267,6 +274,11 @@ function ModelsPage() {
     const counts = builtinRailCounts()
     const customs = customSource.list()
     const customCounts = customRailItems()
+    const providerKeyword = providerSearch.trim().toLowerCase()
+    const matchesProvider = (id: string, label: string) =>
+      [id, label, providerLabelOf(id)].some(text => text.toLowerCase().includes(providerKeyword))
+    const shownBuiltins = [...counts].filter(([id, entry]) => matchesProvider(id, entry.label))
+    const shownCustoms = customs.filter(item => matchesProvider(String(item.id || ''), String(item.name || item.id || '')))
     const total = [...counts.values()].reduce((sum, item) => sum + item.n, 0)
     const allLabel = t('全部（{n} 家）', { n: counts.size })
     // 自定义组「全部」的计数 = 各家模型数之和；「N 家」按实有模型的家算，
@@ -275,35 +287,65 @@ function ModelsPage() {
     const customAllLabel = t('全部（{n} 家）', { n: [...customCounts.values()].filter(item => item.n > 0).length })
     return (
       <Sidebar className='prov-rail' id='prov-rail' aria-label={t('按提供商选择')}>
+        <div className='models-provider-search'>
+          <InputGroup>
+            <InputGroupInput ref={providerSearchRef} id='models-provider-search' type='search'
+              placeholder={t('搜索提供商…')} aria-label={t('搜索提供商')}
+              autoComplete='off' spellCheck={false} value={providerSearch}
+              onChange={event => setProviderSearch(event.currentTarget.value)}
+              onKeyDown={event => {
+                if (event.key === 'Escape' && !event.nativeEvent.isComposing && providerSearch) {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  setProviderSearch('')
+                }
+              }} />
+            <InputGroupAddon aria-hidden='true'>
+              <svg width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='currentColor'
+                strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'>
+                <circle cx='10.5' cy='10.5' r='6.5' /><path d='m16 16 4 4' />
+              </svg>
+            </InputGroupAddon>
+            {providerSearch ? <InputGroupAddon align='inline-end'>
+              <InputGroupButton size='icon-xs' aria-label={t('清空')} title={t('清空')}
+                onClick={() => { setProviderSearch(''); providerSearchRef.current?.focus() }}>
+                <svg width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='currentColor'
+                  strokeWidth='2' strokeLinecap='round' aria-hidden='true'>
+                  <path d='m6 6 12 12M6 18 18 6' />
+                </svg>
+              </InputGroupButton>
+            </InputGroupAddon> : null}
+          </InputGroup>
+        </div>
         <NavList className='rail-scroll'>
-          <div className='rail-label'>{t('内置提供商')}</div>
+          {(!providerKeyword || shownBuiltins.length > 0) && <div className='rail-label'>{t('内置提供商')}</div>}
           {/* 条目是导航项而不是按钮，走 NavItem（选中态 / 悬浮态 / 字重 / 计数都在组件里，
               与原来的 .pv 是同一套令牌取值）。头像（icon=）按家给一枚色相 monogram，
-              见 providerAvatar 的说明。shadow-none 是为了清掉 ui/css/components.css
+              见 ProviderAvatar 的说明。shadow-none 是为了清掉 ui/css/components.css
               里通用 `button { box-shadow: var(--shadow-1) }` —— 平铺的导航列表不该有投影，
               .pv / .nav-item 原先也是显式清掉的 */}
-          <NavItem active={provider === 'all'} data-provider='all' title={allLabel} count={total}
-            icon={providerAvatar('all', '', GRID_GLYPH)}
-            className='shadow-none' onClick={() => selectProvider('all')}>{allLabel}</NavItem>
-          {[...counts].map(([key, entry]) => (
+          {!providerKeyword && <NavItem active={provider === 'all'} data-provider='all' title={allLabel} count={total}
+            icon={<ProviderAvatar id='all' label='' glyph={GRID_GLYPH} />}
+            className='shadow-none' onClick={() => selectProvider('all')}>{allLabel}</NavItem>}
+          {shownBuiltins.map(([key, entry]) => (
             <NavItem key={key} active={provider === key} data-provider={key}
               title={entry.n ? entry.label : t('{provider}：模型清单为空，等待获取', { provider: entry.label })}
-              count={entry.n} icon={providerAvatar(key, entry.label)} className='shadow-none'
+              count={entry.n} icon={<ProviderAvatar id={key} label={entry.label} />} className='shadow-none'
               trailing={entry.n === 0 ? <Badge variant='outline'>{t('待获取')}</Badge> : undefined}
               onClick={() => selectProvider(key)}>{entry.label}</NavItem>
           ))}
-          <div className='rail-label'>{t('自定义提供商')}</div>
+          {(!providerKeyword || shownCustoms.length > 0) && <div className='rail-label'>{t('自定义提供商')}</div>}
           {customs.length ? [
             // 自定义组自己的「全部」：选中时右栏聚合所有自定义家的模型（不含内置家 ——
             // 与上面内置组那颗「全部」是并列的两份聚合）。计数非零才显示条目：
             // 一家都没模型时点进去只有一句空态，挂着反而添噪
-            ...(customTotal > 0 ? [(
+            ...(!providerKeyword && customTotal > 0 ? [(
               <NavItem key={ALL_CUSTOM} active={isAllCustomView()} data-provider={ALL_CUSTOM}
                 title={customAllLabel} count={customTotal}
-                icon={providerAvatar(ALL_CUSTOM, '', GRID_GLYPH)}
+                icon={<ProviderAvatar id={ALL_CUSTOM} label='' glyph={GRID_GLYPH} />}
                 className='shadow-none' onClick={() => selectProvider(ALL_CUSTOM)}>{customAllLabel}</NavItem>
             )] : []),
-            ...customs.map(item => {
+            ...shownCustoms.map(item => {
               const id = String(item.id || '')
               const label = String(item.name || id)
               return (
@@ -312,7 +354,7 @@ function ModelsPage() {
                 <div className='pv-row' key={id}>
                   <NavItem active={provider === id} data-provider={id} title={label}
                     count={customCounts.get(id)?.n ?? 0}
-                    icon={providerAvatar(id, label)}
+                    icon={<ProviderAvatar id={id} label={label} />}
                     className={cn('shadow-none', RAIL_HIDE_COUNT_ON_HOVER)}
                     onClick={() => selectProvider(id)}>{label}</NavItem>
                   <Button size='default' variant='ghost' type='button' className='pv-del' aria-label={t('删除自定义提供商')}
@@ -321,7 +363,12 @@ function ModelsPage() {
                 </div>
               )
             }),
-          ] : <Empty className='rail-empty'>{t('还没有自定义提供商')}</Empty>}
+          ] : !providerKeyword ? <Empty className='rail-empty'>{t('还没有自定义提供商')}</Empty> : null}
+          {providerKeyword && !shownBuiltins.length && !shownCustoms.length ? (
+            <Empty className='models-provider-empty' role='status'>
+              {t('没有匹配「{keyword}」的提供商', { keyword: providerSearch.trim() })}
+            </Empty>
+          ) : null}
         </NavList>
         <div className='rail-foot'>
           <NavItem variant='add' id='rail-add-custom'
@@ -332,13 +379,58 @@ function ModelsPage() {
     )
   }
 
+  React.useEffect(() => {
+    const fromView = state.data?.pricingSettings
+    if (fromView) {
+      setPricingSettings(fromView)
+      updateCachedDisplay({
+        currency: fromView.currency,
+        exchangeRate: fromView.fx?.rate,
+        fx: fromView.fx,
+      })
+    } else if (!pricingSettings) {
+      void loadPricingSettings().then(res => { if (res) setPricingSettings(res) }).catch(() => {})
+    }
+  }, [state.data?.pricingSettings])
+
+  async function reloadPricingAndManage(): Promise<void> {
+    const modelsPanel = (window as unknown as {
+      wbModelsPanel?: { load?: (options?: { force?: boolean }) => Promise<void> }
+    }).wbModelsPanel
+    const [latest] = await Promise.all([
+      loadPricingSettings().catch(() => null),
+      modelsPanel?.load?.({ force: true }) ?? Promise.resolve(),
+    ])
+    if (latest) setPricingSettings(latest)
+  }
+
+  function openModelPricing(model: ManageModel): void {
+    const pid = model.provider || ''
+    setPricingTarget({
+      provider: pid,
+      providerLabel: providerLabelOf(pid),
+      modelId: model.id,
+      pricing: model.pricing ?? null,
+      settings: pricingSettings,
+    })
+  }
+
+  function openProviderPricing(): void {
+    if (provider === 'all' || provider === ALL_CUSTOM) return
+    setProviderPricingTarget({
+      provider,
+      providerLabel: providerLabelOf(provider),
+      settings: pricingSettings,
+    })
+  }
+
   function modelRow(model: ManageModel) {
     // 勾选的行挂 .sel：品牌淡底（比 hover 高一档），让「选中的是哪几行」在滚动后仍可辨
     const picked = selection.has(rowKeyOf(model))
     return (
       <TableRow key={`${model.provider || ''}\u0001${model.id}`} className={cn(picked && 'sel')}>
         <ModelCell model={model} selection={selection} togglePick={togglePick}
-          setTestTarget={setTestTarget} columns={columns} />
+          setTestTarget={setTestTarget} setPricingTarget={openModelPricing} columns={columns} />
       </TableRow>
     )
   }
@@ -459,15 +551,30 @@ function ModelsPage() {
             <CardHeader className='panel-head'>
               <div className='mm-titlebar'>
                 <div className='mm-title'>
-                  {provider === 'all' || provider === ALL_CUSTOM
-                    ? providerAvatar(provider, '', GRID_GLYPH)
-                    : providerAvatar(provider, titleLabel)}
+                  <ProviderAvatar id={provider} label={titleLabel} glyph={provider === 'all' || provider === ALL_CUSTOM ? GRID_GLYPH : undefined} />
                   <h2>{titleLabel}</h2>
                   <span className='mm-meta'>
                     <b>{providerModels.length}</b>{t(' 个模型 · 已启用 ')}<b>{enabledCount}</b>{t(' · 有映射 ')}<b>{mappedCount}</b>
                   </span>
                 </div>
                 <div className='head-actions'>
+                  <SegmentedControl
+                    value={pricingDisplay.currency}
+                    onValueChange={value => { void switchDisplayCurrency(value as 'usd' | 'cny') }}
+                    options={[{ value: 'usd', label: 'USD $' }, { value: 'cny', label: 'CNY ¥' }]}
+                    aria-label={t('计价货币')}
+                  />
+                  {provider !== 'all' && provider !== ALL_CUSTOM ? (() => {
+                    const rule = pricingSettings?.providerPricing?.[provider]
+                    const tag = rule?.priceRate ? ` ×${rule.priceRate}` : rule?.rateWindows?.length ? ` ${rule.rateWindows.length}时段` : ''
+                    return (
+                      <Button variant='outline' size='sm' onClick={openProviderPricing}>
+                        {t('计价倍率')}{tag}
+                      </Button>
+                    )
+                  })() : null}
+                  {view.providers?.some(item => item.provider === provider && item.settingsAvailable) ? <Button variant='outline' size='sm'
+                    onClick={() => openProviderSettings(provider)}>{t('提供商设置')}</Button> : null}
                   {/* 「获取模型」是这一页的主操作（把清单拉回来），用实心主按钮建立主次；
                       「添加模型」是补充，维持描边档。文案与 title 只有一处事实来源（这里），
                       index.html 里不写死 */}
@@ -489,8 +596,6 @@ function ModelsPage() {
                       return n > 0 ? <Badge variant='brand' shape='tag' className='mm-filter-badge'>{n}</Badge> : null
                     })()}
                   </Button>
-                  <Button id='btn-compact-routes' variant='outline' size='sm'
-                    onClick={() => setCompactOpen(true)}>{t('压缩路由')}</Button>
                 </div>
               </div>
               <ResponsiveSheet open={filterOpen} onOpenChange={setFilterOpen} title={t('筛选')}
@@ -540,6 +645,7 @@ function ModelsPage() {
                   <col className='c-check' data-col='check' />
                   <col className='c-model' data-col='model' />
                   <col className='c-rate' data-col='rate' />
+                  <col className='c-pricing' data-col='pricing' />
                   <col className='c-visibility' data-col='visibility' />
                   <col className='c-source' data-col='source' />
                   <col className='c-budget' data-col='budget' />
@@ -562,6 +668,7 @@ function ModelsPage() {
                       setSort(`rate-${direction}`)
                       paging.goto(1)
                     }}>{t('倍率')}</TableHead>
+                  <TableHead data-col='pricing' title={t('点击任意单元格可覆盖单价或设置参考模型')}>{t('计价')}</TableHead>
                   <TableHead data-col='visibility' title={t('这个模型在官方客户端里是否会被展列；不展示的那些默认已关闭（含默认绑定）')}>{t('可见性')}</TableHead>
                   <TableHead data-col='source'>{t('来源')}</TableHead>
                   {/* 表头只留短标题，完整口径进问号提示（原括号长标题让表头喧宾夺主）。
@@ -634,7 +741,6 @@ function ModelsPage() {
         </div>
       </Card>
       {/* 弹窗走 Dialog（Esc / 点遮罩关闭、焦点陷阱、滚动锁定都内建），按需挂载、关闭即卸 */}
-      {compactOpen ? <CompactRoutesDialog onClose={() => setCompactOpen(false)} /> : null}
       {state.mapping ? <MappingDialog context={state.mapping} onClose={closeMapping} /> : null}
       {state.customModel
         ? <CustomModelDialog initial={state.customModel} onClose={closeCustomModel} />
@@ -648,6 +754,14 @@ function ModelsPage() {
       {batchOpen
         ? <ModelBatchDialog models={selectedModels} onClose={() => setBatchOpen(false)}
           onDone={() => { setSelection(new Set()); setBatchOpen(false) }} />
+        : null}
+      {pricingTarget
+        ? <ModelPricingDialog context={pricingTarget} onClose={() => setPricingTarget(null)}
+          onSaved={reloadPricingAndManage} />
+        : null}
+      {providerPricingTarget
+        ? <ProviderPricingDialog context={providerPricingTarget} onClose={() => setProviderPricingTarget(null)}
+          onSaved={reloadPricingAndManage} />
         : null}
     </>
   )
