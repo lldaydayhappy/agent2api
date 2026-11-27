@@ -1,5 +1,5 @@
 //! 指纹脱敏配置：`GET/PUT /api/sanitize`。
-//! 允许部分更新；规则 null = 恢复内置词表，规则 [] = 空词表，提供商 [] = 全部。
+//! 允许部分更新；规则 null = 恢复内置词表，规则 [] = 空词表，提供商 null = 恢复默认（WorkBuddy 国内版与国际版），提供商 [] = 全部。
 
 use std::sync::Arc;
 
@@ -34,14 +34,14 @@ pub async fn put_sanitize(State(_state): State<ServerState>, body: Bytes) -> Res
     let enabled = patch.enabled;
     let saved = config::set_sanitize_settings(patch);
     if !saved {
-        logging::log("[Config]", "⚠️  出站指纹脱敏设置写入失败，本次运行内仍生效");
+        logging::log("[Config]", "⚠️  出站关键词替换设置写入失败，本次运行内仍生效");
     }
     logging::log(
         "[Config]",
         match enabled {
-            Some(true) => "出站指纹脱敏已开启",
-            Some(false) => "出站指纹脱敏已关闭：请求内容将不再按脱敏词表改写",
-            None => "出站指纹脱敏词表 / 提供商范围已更新",
+            Some(true) => "出站关键词替换已开启",
+            Some(false) => "出站关键词替换已关闭：请求内容将不再按替换规则改写",
+            None => "出站关键词替换规则 / 提供商范围已更新",
         },
     );
     let mut result = sanitize_json();
@@ -59,7 +59,7 @@ fn parse_patch(payload: &Value) -> Result<SanitizePatch, String> {
     .iter()
     .any(|key| object.contains_key(*key))
     {
-        return Err("请提供指纹脱敏开关、词表或应用提供商".to_string());
+        return Err("请提供关键词替换开关、规则列表或应用提供商".to_string());
     }
     let enabled = object
         .get(KEY_SANITIZE_FINGERPRINTS)
@@ -74,14 +74,15 @@ fn parse_patch(payload: &Value) -> Result<SanitizePatch, String> {
         Some(Value::Null) => Some(None),
         Some(value) => {
             let entries = serde_json::from_value::<Vec<sanitize::SanitizeRule>>(value.clone())
-                .map_err(|error| format!("脱敏词表必须是合法的规则数组：{error}"))?;
+                .map_err(|error| format!("替换规则必须是合法的规则数组：{error}"))?;
             Some(Some(Arc::new(sanitize::RuleSet::compile(entries)?)))
         }
     };
-    let selected = object
-        .get(KEY_SANITIZE_PROVIDERS)
-        .map(parse_providers)
-        .transpose()?;
+    let selected = match object.get(KEY_SANITIZE_PROVIDERS) {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(value) => Some(Some(parse_providers(value)?)),
+    };
     Ok(SanitizePatch {
         enabled,
         rules,
@@ -90,9 +91,6 @@ fn parse_patch(payload: &Value) -> Result<SanitizePatch, String> {
 }
 
 fn parse_providers(value: &Value) -> Result<Vec<String>, String> {
-    if value.is_null() {
-        return Ok(Vec::new());
-    }
     let items = value
         .as_array()
         .ok_or_else(|| format!("{KEY_SANITIZE_PROVIDERS} 必须是字符串数组"))?;
@@ -141,6 +139,7 @@ fn sanitize_json() -> Value {
         KEY_SANITIZE_FINGERPRINTS: settings.enabled,
         KEY_SANITIZE_RULES: settings.rules.entries(),
         KEY_SANITIZE_PROVIDERS: settings.providers,
+        "defaultProviders": config::default_sanitize_providers(),
         "defaultRules": sanitize::default_rules().entries(),
         "customRules": settings.custom_rules,
         "providerOptions": options,

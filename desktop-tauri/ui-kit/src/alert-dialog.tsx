@@ -59,17 +59,20 @@ function AlertDialogOverlay({ className, ...props }: AlertDialogPrimitive.Backdr
 type AlertDialogContentProps = AlertDialogPrimitive.Popup.Props & {
   /** 是否自带右上角关闭按钮，默认 false —— 强制选择类弹窗不留「✕」这条模糊出口 */
   showCloseButton?: boolean
+  /** 嵌在另一层弹窗里时强制渲染遮罩，默认 false */
+  overlayForceRender?: boolean
 }
 
 function AlertDialogContent({
   className,
   children,
   showCloseButton = false,
+  overlayForceRender = false,
   ...props
 }: AlertDialogContentProps) {
   return (
     <AlertDialogPortal>
-      <AlertDialogOverlay />
+      <AlertDialogOverlay forceRender={overlayForceRender} />
       <AlertDialogPrimitive.Popup
         data-slot='alert-dialog-content'
         className={cn(
@@ -105,14 +108,15 @@ function AlertDialogContent({
   )
 }
 
-/** 标题栏：与 DialogHeader 同款（左侧标题、底部发丝线、右侧留白给关闭钮） */
+/** 标题栏：纵向排布（主标题 + 可选副标题，底部发丝线；常规确认正文推荐放进 AlertDialogBody） */
 function AlertDialogHeader({ className, ...props }: React.ComponentProps<'div'>) {
   return (
     <div
       data-slot='alert-dialog-header'
       className={cn(
-        'flex items-center gap-2.5 border-b border-hairline px-5 py-[15px]',
-        '[&_h2]:flex-1 [&_h2]:text-[14.5px] [&_h2]:font-semibold',
+        'flex flex-col gap-1 border-b border-hairline px-5 py-[15px]',
+        '[&_h2]:m-0 [&_h2]:text-[14.5px] [&_h2]:font-semibold',
+        '[&_p]:m-0 [&_p]:text-xs [&_p]:leading-relaxed [&_p]:text-muted-foreground',
         className
       )}
       {...props}
