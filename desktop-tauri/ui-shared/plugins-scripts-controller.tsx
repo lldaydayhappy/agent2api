@@ -21,6 +21,9 @@ import {
   scriptSourceLabel, updateLabel,
 } from './plugins-script-display'
 import { ScriptRepository, scriptUnavailableReason, type PluginOpenExternal } from './plugins-script-catalog'
+import {
+  formatScriptOperationFailure, resolveScriptOperationRetry, type PluginErrorBannerState,
+} from './plugins-error-banner'
 
 type InstallDraft = { name: string; version: string; id?: string }
 type ScriptCardOptions = {
@@ -114,6 +117,7 @@ const ScriptInstalledRow = React.memo(function ScriptInstalledRow({
     name={name}
     description={scriptPluginDescription(pack, matchedList, t)}
     version={pack.version}
+    downloads={pack.downloads ?? matchedRecommendation?.downloads}
     icon={icon}
     highlightedSource={scriptOfficialBadge(pack)}
     sourceLabel={scriptSourceLabel(pack, t)}
@@ -190,6 +194,7 @@ const ScriptRecommendedRow = React.memo(function ScriptRecommendedRow({
     name={item.label}
     description={recommendedDescription(item, t)}
     version={item.version}
+    downloads={item.downloads}
     onDetails={handleDetails}
     highlightedSource={scriptOfficialBadge(item)}
     sourceLabel={scriptSourceLabel(item, t)}
@@ -211,6 +216,7 @@ export type ScriptPluginsController = {
   locked: boolean
   busy: boolean
   failure: string
+  failureBanner: PluginErrorBannerState | null
   iconUrl: (value?: string | null) => string | undefined
   renderInstalled: (pack: ScriptPackage, options: ScriptCardOptions) => React.ReactElement
   renderRecommended: (item: ScriptRecommendation, options: ScriptCardOptions) => React.ReactElement
@@ -247,6 +253,7 @@ export function useScriptPluginsController({
   const [detailsRecommendation, setDetailsRecommendation] = React.useState<ScriptRecommendation | null>(null)
   const [busy, setBusy] = React.useState(false)
   const [error, setError] = React.useState('')
+  const [dismissedKey, setDismissedKey] = React.useState('')
   const [operationTarget, setOperationTarget] = React.useState<ScriptOperation['target']>()
   const pending = React.useRef(false)
   const lastInstallRequest = React.useRef(0)
@@ -306,7 +313,8 @@ export function useScriptPluginsController({
   React.useEffect(() => { onBusyChange?.(busy) }, [busy, onBusyChange])
   React.useEffect(() => () => { onBusyChange?.(false) }, [onBusyChange])
   React.useEffect(() => {
-    if (!state?.operation.active) setOperationTarget(undefined)
+    if (state?.operation.active) setDismissedKey('')
+    else setOperationTarget(undefined)
   }, [state?.operation.active, state?.operation.updatedAt])
   React.useEffect(() => {
     if (installRequest <= lastInstallRequest.current) return
@@ -325,7 +333,7 @@ export function useScriptPluginsController({
     const currentState = stateRef.current
     if (pending.current || lockedRef.current || !currentState) return false
     pending.current = true
-    setBusy(true); setError('')
+    setBusy(true); setError(''); setDismissedKey('')
     const id = typeof body.id === 'string' ? body.id : undefined
     const pack = currentState.packages.find(item => item.id === id)
     setOperationTarget({ id, name: pack?.name, source: typeof body.name === 'string' ? body.name.trim() : undefined })
@@ -377,8 +385,54 @@ export function useScriptPluginsController({
   }
 
   const starting = packages.some(pack => pluginPending(startupForPack(pack.id, pack.startup)))
-  const rawFailure = error || state?.error || (!starting && (state?.hostError || state?.runtime.error || state?.operation.error))
-  const failure = typeof rawFailure === 'string' ? rawFailure : ''
+  const failureBanner = React.useMemo<PluginErrorBannerState | null>(() => {
+    if (error) {
+      return { message: error, onDismiss: () => setError('') }
+    }
+    if (state?.error) {
+      const key = `state:${state.error}`
+      if (dismissedKey === key) return null
+      return {
+        message: state.error,
+        retryDisabled: locked,
+        onRetry: () => { setDismissedKey(''); void refreshRef.current() },
+        onDismiss: () => setDismissedKey(key),
+      }
+    }
+    if (starting) return null
+    const hostOrRuntime = state?.hostError || state?.runtime.error || ''
+    if (hostOrRuntime) {
+      const key = `host:${hostOrRuntime}`
+      if (dismissedKey === key) return null
+      return {
+        message: hostOrRuntime,
+        retryDisabled: locked,
+        onRetry: () => { setDismissedKey(''); void refreshRef.current() },
+        onDismiss: () => setDismissedKey(key),
+      }
+    }
+    if (state?.operation.error) {
+      const op = state.operation
+      const key = `op:${op.operationId || op.updatedAt || ''}:${op.error}`
+      if (dismissedKey === key) return null
+      const message = formatScriptOperationFailure(op, packages, recommended, t)
+      const onRetry = resolveScriptOperationRetry(op, packages, { run: act, openInstall })
+      return {
+        message,
+        retryDisabled: locked,
+        onRetry,
+        onDismiss: () => {
+          setDismissedKey(key)
+          void requestRef.current('/api/plugins/scripts/change', {
+            action: 'dismiss_error',
+            operationId: op.operationId || undefined,
+          }).then(() => refreshRef.current()).catch(() => undefined)
+        },
+      }
+    }
+    return null
+  }, [error, state, starting, dismissedKey, locked, packages, recommended, t, act, openInstall])
+  const failure = failureBanner?.message || ''
 
   const renderInstalled = React.useCallback((pack: ScriptPackage, options: ScriptCardOptions) => (
     <ScriptInstalledRow
@@ -427,6 +481,7 @@ export function useScriptPluginsController({
 
   const dialogs = <>
     {detailsItem ? <PluginDetailsDialog name={detailsItem.label} version={detailsItem.version} sourceLabel={scriptSourceLabel(detailsItem, t)}
+      downloads={detailsItem.downloads}
       description={recommendedDescription(detailsItem, t)} icon={iconUrl(detailsItem.icon)} t={t} onClose={() => setDetailsRecommendation(null)}
       metadata={<>
         <ScriptRepository item={detailsItem} onOpenExternal={onOpenExternal} t={t} />
@@ -491,5 +546,5 @@ export function useScriptPluginsController({
     </Dialog>
   </>
 
-  return { operation, recommended, locked, busy, failure, iconUrl, renderInstalled, renderRecommended, dialogs }
+  return { operation, recommended, locked, busy, failure, failureBanner, iconUrl, renderInstalled, renderRecommended, dialogs }
 }
